@@ -44,3 +44,7 @@ core.*
 
 # Ignore all logs
 *.log
+
+build-remote.sh
+build.sh
+/target-remote/

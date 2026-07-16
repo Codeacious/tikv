@@ -979,6 +979,12 @@ where
         )?;
         let applied_index = ps.applied_index();
 
+        let read_only_option = match cfg.read_mode.as_str() {
+            "lease-based" => raft::ReadOnlyOption::LeaseBased,
+            "grant-leases" => raft::ReadOnlyOption::GrantLeases,
+            // Anything else will be treated as "safe"
+            _ => raft::ReadOnlyOption::Safe,
+        };
         let raft_cfg = raft::Config {
             id: peer.get_id(),
             election_tick: cfg.raft_election_timeout_ticks,
@@ -996,6 +1002,11 @@ where
             // always disable applying unpersisted log at initialization,
             // will enable it after applying to the current last_index.
             max_apply_unpersisted_log_limit: 0,
+            read_only_option,
+            read_lease_duration_micros: cfg.read_lease_duration_micros,
+            max_num_read_leases: cfg.max_num_read_leases,
+            ask_for_read_lease: read_only_option == raft::ReadOnlyOption::GrantLeases,
+            read_lease_catchup_margin: cfg.read_lease_catchup_margin,
             ..Default::default()
         };
 

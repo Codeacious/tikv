@@ -11,7 +11,10 @@ use std::{
     },
     iter::Iterator,
     mem,
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
     time::{Duration, Instant},
     u64,
 };
@@ -23,7 +26,7 @@ use engine_traits::{
 };
 use error_code::ErrorCodeExt;
 use fail::fail_point;
-use futures::channel::mpsc::UnboundedSender;
+use futures::{channel::mpsc::UnboundedSender, compat::Future01CompatExt, FutureExt};
 use itertools::Itertools;
 use keys::{self, enc_end_key, enc_start_key};
 use kvproto::{
@@ -55,7 +58,8 @@ use smallvec::SmallVec;
 use strum::{EnumCount, VariantNames};
 use tikv_alloc::trace::TraceEvent;
 use tikv_util::{
-    box_err, debug, defer, error, escape, info, info_or_debug, is_zero_duration,
+    box_err, debug, defer, error, escape, future::poll_future_notify, info, info_or_debug,
+    is_zero_duration,
     mpsc::{self, LooseBoundedSender, Receiver},
     slow_log,
     store::{find_peer, find_peer_by_id, is_learner, region_on_same_stores},
@@ -152,6 +156,11 @@ where
     /// A registry for all scheduled ticks. This can avoid scheduling ticks
     /// twice accidentally.
     tick_registry: [bool; PeerTick::VARIANT_COUNT],
+    // Guard epoch for the read index delay timer. When incremented, previously
+    // scheduled timers will noop when fired.
+    read_index_delay_epoch: Arc<AtomicU64>,
+    // The time the read index delay timer was armed for. Used to see if re-arming is needed.
+    read_index_delay_armed_at: Option<u64>,
     /// Ticks for speed up campaign in chaos state.
     ///
     /// Followers will keep ticking in Idle mode to measure how many ticks have
@@ -296,6 +305,8 @@ where
                     raft_metrics,
                 )?,
                 tick_registry: [false; PeerTick::VARIANT_COUNT],
+                read_index_delay_epoch: Arc::new(AtomicU64::new(0)),
+                read_index_delay_armed_at: None,
                 missing_ticks: 0,
                 hibernate_state: HibernateState::ordered(),
                 stopped: false,
@@ -358,6 +369,8 @@ where
                     raft_metrics,
                 )?,
                 tick_registry: [false; PeerTick::VARIANT_COUNT],
+                read_index_delay_epoch: Arc::new(AtomicU64::new(0)),
+                read_index_delay_armed_at: None,
                 missing_ticks: 0,
                 hibernate_state: HibernateState::ordered(),
                 stopped: false,
@@ -748,6 +761,7 @@ where
             }
         }
         self.on_loop_finished();
+        self.schedule_read_index_delay_tick();
         slow_log!(
             T timer,
             "{} handle {} peer messages {:?}, detail: {:?}",
@@ -1373,6 +1387,7 @@ where
             PeerTick::CheckPeersAvailability => self.on_check_peers_availability(),
             PeerTick::RequestSnapshot => self.on_request_snapshot_tick(),
             PeerTick::RequestVoterReplicatedIndex => self.on_request_voter_replicated_index(),
+            PeerTick::ReadIndexDelayGiveUp => self.read_index_delay_tick(),
         }
     }
 
@@ -2309,6 +2324,72 @@ where
             }
         });
         self.ctx.tick_batch[idx].ticks.push(cb);
+    }
+
+    /// Arms a timer that fires at a follower's read-index delay deadline, if any.
+    /// Only relevant when a follower holds a read lease (using `GrantLeases`).
+    /// No-op when the delayer holds nothing.
+    fn schedule_read_index_delay_tick(&mut self) {
+        let idx = PeerTick::ReadIndexDelayGiveUp as usize;
+        let next_deadline = self.fsm.peer.raft_group.next_read_index_delay_micros();
+        if self.fsm.tick_registry[idx] {
+            match (next_deadline, self.fsm.read_index_delay_armed_at) {
+                (Some(next), Some(armed)) if next <= armed => return,
+                // Queue emptied while a timer was pending
+                (None, _) => {
+                    self.fsm.read_index_delay_epoch.fetch_add(1, Ordering::SeqCst);
+                    self.fsm.tick_registry[idx] = false;
+                    self.fsm.read_index_delay_armed_at = None;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        let timeout = match self
+            .fsm
+            .peer
+            .raft_group
+            .next_read_index_delay_timeout_micros()
+        {
+            Some(us) => Duration::from_micros(us),
+            None => return,
+        };
+        let region_id = self.region_id();
+        let mb = match self.ctx.router.mailbox(region_id) {
+            Some(mb) => mb,
+            None => return,
+        };
+        self.fsm.tick_registry[idx] = true;
+        self.fsm.read_index_delay_armed_at = next_deadline;
+        // Supersede any still-pending timer; only the timer with the current `epoch` can fire.
+        let epoch = self
+            .fsm
+            .read_index_delay_epoch
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+        let epoch_guard = self.fsm.read_index_delay_epoch.clone();
+        let peer_id = self.fsm.peer.peer_id();
+        let delay = self.ctx.timer.delay(timeout).compat().map(move |_| {
+            if epoch_guard.load(Ordering::SeqCst) != epoch {
+                return;
+            }
+            if let Err(e) = mb.force_send(PeerMsg::Tick(PeerTick::ReadIndexDelayGiveUp)) {
+                debug!(
+                    "failed to schedule read-index delay give-up tick";
+                    "region_id" => region_id,
+                    "peer_id" => peer_id,
+                    "err" => %e,
+                );
+            }
+        });
+        poll_future_notify(delay);
+    }
+
+    fn read_index_delay_tick(&mut self) {
+        if self.fsm.peer.raft_group.fire_read_index_delays() {
+            self.fsm.has_ready = true;
+        }
+        self.schedule_read_index_delay_tick();
     }
 
     fn register_raft_base_tick(&mut self) {

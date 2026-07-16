@@ -97,6 +97,24 @@ pub struct Config {
     // follower_read_max_log_gap,
     #[doc(hidden)]
     pub follower_read_max_log_gap: u64,
+
+    // Raft read-only consistency mode. Selects the raft `ReadOnlyOption`:
+    //   "safe"        -> ReadOnlyOption::Safe
+    //   "lease-based" -> ReadOnlyOption::LeaseBased
+    //   "grant-leases"-> ReadOnlyOption::GrantLeases (read-leases granted to followers).
+    #[online_config(skip)]
+    pub read_mode: String,
+    // Options for follower read leases; i.e. when read_mode == "grant-leases".
+    #[doc(hidden)]
+    #[online_config(hidden)]
+    pub read_lease_duration_micros: u64,
+    #[doc(hidden)]
+    #[online_config(hidden)]
+    pub max_num_read_leases: usize,
+    #[doc(hidden)]
+    #[online_config(hidden)]
+    pub read_lease_catchup_margin: u64,
+
     // Old Raft logs could be reserved if `raft_log_gc_threshold` is not reached.
     // GC them after ticks `raft_log_reserve_max_ticks` times.
     #[doc(hidden)]
@@ -535,6 +553,10 @@ impl Default for Config {
             max_apply_unpersisted_log_limit: 1024,
             raft_read_index_retry_interval_ticks: 4,
             follower_read_max_log_gap: 100,
+            read_mode: "safe".to_owned(),
+            read_lease_duration_micros: 500_000,
+            max_num_read_leases: 5,
+            read_lease_catchup_margin: 10,
             raft_log_reserve_max_ticks: 6,
             raft_engine_purge_interval: ReadableDuration::secs(10),
             max_manual_flush_rate: 3.0,
@@ -773,6 +795,25 @@ impl Config {
     ) -> Result<()> {
         if self.raft_heartbeat_ticks == 0 {
             return Err(box_err!("heartbeat tick must greater than 0"));
+        }
+
+        match self.read_mode.as_str() {
+            "safe" | "lease-based" => {}
+            "grant-leases" => {
+                if self.unsafe_disable_check_quorum {
+                    return Err(box_err!(
+                        "read_mode == \"grant-leases\" requires \
+                        unsafe_disable_check_quorum to be false"
+                    ));
+                }
+            }
+            other => {
+                return Err(box_err!(
+                    "invalid read_mode {:?}, expected one of \
+                     \"safe\", \"lease-based\", \"grant-leases\"",
+                    other
+                ));
+            }
         }
 
         if self.raft_election_timeout_ticks != 10 {

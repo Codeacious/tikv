@@ -59,7 +59,12 @@ impl RaftSendMessageMetrics {
             | MessageType::MsgPropose
             | MessageType::MsgUnreachable
             | MessageType::MsgSnapStatus
-            | MessageType::MsgCheckQuorum => {}
+            | MessageType::MsgCheckQuorum
+            // Follower read-lease messages (raft-rs read-leases feature); not tracked here.
+            | MessageType::MsgAskReadLease
+            | MessageType::MsgAskReadLeaseResp
+            | MessageType::MsgAskAckIndex
+            | MessageType::MsgAskAckIndexResp => {}
         }
     }
 

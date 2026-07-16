@@ -253,6 +253,10 @@ pub fn overwrite_config_with_cmd_args(config: &mut TikvConfig, matches: &ArgMatc
         config.server.addr = addr.to_owned();
     }
 
+    if let Some(read_mode) = matches.value_of("read-mode") {
+        config.raft_store.read_mode = read_mode.to_owned();
+    }
+
     if let Some(advertise_addr) = matches.value_of("advertise-addr") {
         config.server.advertise_addr = advertise_addr.to_owned();
     }

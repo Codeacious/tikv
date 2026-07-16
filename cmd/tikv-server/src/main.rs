@@ -79,6 +79,14 @@ fn main() {
                 .help("Set the listening address"),
         )
         .arg(
+            Arg::with_name("read-mode")
+                .long("read-mode")
+                .takes_value(true)
+                .value_name("MODE")
+                .possible_values(&["safe", "lease-based", "grant-leases"])
+                .help("Set the raft read consistency mode"),
+        )
+        .arg(
             Arg::with_name("advertise-addr")
                 .long("advertise-addr")
                 .takes_value(true)
