@@ -115,6 +115,14 @@ pub struct Config {
     #[online_config(hidden)]
     pub read_lease_catchup_margin: u64,
 
+    // Options for the "assist" read_mode, which uses a UDP sidechannel to an on-path P4 switch.
+    #[online_config(skip)]
+    pub udp_sidechannel_ip: String,
+    #[online_config(skip)]
+    pub udp_sidechannel_port: u16,
+    #[online_config(skip)]
+    pub udp_sidechannel_magic: u16,
+
     // Old Raft logs could be reserved if `raft_log_gc_threshold` is not reached.
     // GC them after ticks `raft_log_reserve_max_ticks` times.
     #[doc(hidden)]
@@ -557,6 +565,9 @@ impl Default for Config {
             read_lease_duration_micros: 500_000,
             max_num_read_leases: 5,
             read_lease_catchup_margin: 10,
+            udp_sidechannel_ip: "0.0.0.0".to_owned(),
+            udp_sidechannel_port: 7700,
+            udp_sidechannel_magic: 0xFEED,
             raft_log_reserve_max_ticks: 6,
             raft_engine_purge_interval: ReadableDuration::secs(10),
             max_manual_flush_rate: 3.0,
@@ -786,6 +797,10 @@ impl Config {
         self.inspect_network_interval = inspect_network_interval;
     }
 
+    pub fn udp_sidechannel_enabled(&self) -> bool {
+        self.read_mode == "assist"
+    }
+
     pub fn validate(
         &mut self,
         region_split_size: ReadableSize,
@@ -799,18 +814,21 @@ impl Config {
 
         match self.read_mode.as_str() {
             "safe" | "lease-based" => {}
-            "grant-leases" => {
+            // "assist" is "grant-leases" plus the P4 UDP sidechannel; both grant
+            // follower read leases and so require check_quorum.
+            "grant-leases" | "assist" => {
                 if self.unsafe_disable_check_quorum {
                     return Err(box_err!(
-                        "read_mode == \"grant-leases\" requires \
-                        unsafe_disable_check_quorum to be false"
+                        "read_mode == {:?} requires \
+                        unsafe_disable_check_quorum to be false",
+                        self.read_mode
                     ));
                 }
             }
             other => {
                 return Err(box_err!(
                     "invalid read_mode {:?}, expected one of \
-                     \"safe\", \"lease-based\", \"grant-leases\"",
+                     \"safe\", \"lease-based\", \"grant-leases\", \"assist\"",
                     other
                 ));
             }

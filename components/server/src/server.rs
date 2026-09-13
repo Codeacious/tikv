@@ -113,8 +113,8 @@ use tikv::{
         status_server::StatusServer,
         tablet_snap::NoSnapshotCache,
         ttl::TtlChecker,
-        KvEngineFactoryBuilder, MultiRaftServer, RaftKv, Server, CPU_CORES_QUOTA_GAUGE,
-        GRPC_THREAD_PREFIX, MEMORY_LIMIT_GAUGE,
+        init_global_udp_sidechannel, KvEngineFactoryBuilder, MultiRaftServer, RaftKv,
+        RaftMessageFeeder, Server, CPU_CORES_QUOTA_GAUGE, GRPC_THREAD_PREFIX, MEMORY_LIMIT_GAUGE,
     },
     storage::{
         self,
@@ -896,6 +896,27 @@ where
             self.resource_manager.clone(),
         );
         let copr_config_manager = copr.config_manager();
+
+        // Bring up the UDP sidechannel to the P4 switch in "assist" read_mode.
+        // It publishes itself + its read gate as process-globals, which the
+        // outgoing tap (RaftClient), peer discovery (KvService), and the read
+        // path (raftstore Peer) read back. No-op in every other read mode.
+        if self.core.config.raft_store.udp_sidechannel_enabled() {
+            let rs = &self.core.config.raft_store;
+            let feeder: Box<dyn RaftMessageFeeder> =
+                Box::new(storage.get_engine().raft_extension());
+            if init_global_udp_sidechannel(
+                raft_server.id(),
+                &rs.udp_sidechannel_ip,
+                rs.udp_sidechannel_port,
+                rs.udp_sidechannel_magic,
+                feeder,
+            )
+            .is_none()
+            {
+                warn!("failed to start UDP sidechannel; assist-mode acceleration disabled");
+            }
+        }
 
         // Create server
         let server = Server::new(
@@ -1728,8 +1749,8 @@ where
                 break;
             }
 
-            info!("Waiting for leader eviction"; 
-                  "leaders_count" => leaders_count, 
+            info!("Waiting for leader eviction";
+                  "leaders_count" => leaders_count,
                   "elapsed" => ?now.saturating_elapsed());
             std::thread::sleep(check_interval);
         }

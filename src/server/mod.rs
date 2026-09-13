@@ -24,6 +24,7 @@ pub mod status_server;
 pub mod tablet_snap;
 pub mod transport;
 pub mod ttl;
+pub mod udp_sidechannel;
 
 pub use engine_factory::{KvEngineFactory, KvEngineFactoryBuilder};
 
@@ -43,4 +44,8 @@ pub use self::{
     resolve::{PdStoreAddrResolver, StoreAddrResolver},
     server::{Server, GRPC_THREAD_PREFIX},
     transport::ServerTransport,
+    udp_sidechannel::{
+        global_udp_sidechannel, init_global as init_global_udp_sidechannel, RaftMessageFeeder,
+        UdpSidechannel, DEFAULT_UDP_SIDECHANNEL_MAGIC, DEFAULT_UDP_SIDECHANNEL_PORT,
+    },
 };

@@ -762,6 +762,9 @@ where
         }
         self.on_loop_finished();
         self.schedule_read_index_delay_tick();
+        self.schedule_read_lease_renewal_tick();
+        self.schedule_read_lease_expiry_tick();
+        self.schedule_switch_register_refresh_tick();
         slow_log!(
             T timer,
             "{} handle {} peer messages {:?}, detail: {:?}",
@@ -1388,6 +1391,9 @@ where
             PeerTick::RequestSnapshot => self.on_request_snapshot_tick(),
             PeerTick::RequestVoterReplicatedIndex => self.on_request_voter_replicated_index(),
             PeerTick::ReadIndexDelayGiveUp => self.read_index_delay_tick(),
+            PeerTick::ReadLeaseRenew => self.read_lease_renewal_tick(),
+            PeerTick::ReadLeaseExpiry => self.read_lease_expiry_tick(),
+            PeerTick::SwitchRegisterRefresh => self.switch_register_refresh_tick(),
         }
     }
 
@@ -2392,6 +2398,168 @@ where
         self.schedule_read_index_delay_tick();
     }
 
+    /// Arms a timer to drive follower read-lease renewal.
+    /// raft-rs only renews a lease when it processes a heartbeat or a read.
+    /// The handler re-arms from the next renewal deadline.
+    fn schedule_read_lease_renewal_tick(&mut self) {
+        let idx = PeerTick::ReadLeaseRenew as usize;
+        if self.fsm.tick_registry[idx] {
+            return;
+        }
+        let timeout = match self
+            .fsm
+            .peer
+            .raft_group
+            .micros_until_lease_renewal_timeout_micros()
+        {
+            // None means not a lease-asking follower right now
+            None => return,
+            Some(us) => Duration::from_micros(us),
+        };
+        let region_id = self.region_id();
+        let mb = match self.ctx.router.mailbox(region_id) {
+            Some(mb) => mb,
+            None => return,
+        };
+        self.fsm.tick_registry[idx] = true;
+        let peer_id = self.fsm.peer.peer_id();
+        let delay = self.ctx.timer.delay(timeout).compat().map(move |_| {
+            if let Err(e) = mb.force_send(PeerMsg::Tick(PeerTick::ReadLeaseRenew)) {
+                debug!(
+                    "failed to schedule read-lease renewal tick";
+                    "region_id" => region_id,
+                    "peer_id" => peer_id,
+                    "err" => %e,
+                );
+            }
+        });
+        poll_future_notify(delay);
+    }
+
+    fn read_lease_renewal_tick(&mut self) {
+        if self.fsm.peer.raft_group.maybe_renew_read_lease() {
+            self.fsm.has_ready = true;
+        }
+        self.schedule_read_lease_renewal_tick();
+    }
+
+    /// Leader-side companion to the follower read lease renewal timer.
+    /// Arms a timer that fires at the next soonest granted read lease expiry time,
+    /// so that expired read leases can be cleaned up and any pending writes can be unblocked.
+    fn schedule_read_lease_expiry_tick(&mut self) {
+        let idx = PeerTick::ReadLeaseExpiry as usize;
+        if self.fsm.tick_registry[idx] {
+            return;
+        }
+        let timeout = match self
+            .fsm
+            .peer
+            .raft_group
+            .micros_until_next_lease_expiry_timeout()
+        {
+            // Not a GrantLeases leader holding leases; leave disarmed.
+            None => return,
+            Some(us) => Duration::from_micros(us),
+        };
+        let region_id = self.region_id();
+        let mb = match self.ctx.router.mailbox(region_id) {
+            Some(mb) => mb,
+            None => return,
+        };
+        self.fsm.tick_registry[idx] = true;
+        let peer_id = self.fsm.peer.peer_id();
+        let delay = self.ctx.timer.delay(timeout).compat().map(move |_| {
+            if let Err(e) = mb.force_send(PeerMsg::Tick(PeerTick::ReadLeaseExpiry)) {
+                debug!(
+                    "failed to schedule read-lease expiry tick";
+                    "region_id" => region_id,
+                    "peer_id" => peer_id,
+                    "err" => %e,
+                );
+            }
+        });
+        poll_future_notify(delay);
+    }
+
+    fn read_lease_expiry_tick(&mut self) {
+        if self
+            .fsm
+            .peer
+            .raft_group
+            .expire_read_leases_and_maybe_commit()
+        {
+            self.fsm.has_ready = true;
+        }
+        self.schedule_read_lease_expiry_tick();
+    }
+
+    /// Leader-driven idle refresh of a region's switch's ack-index register.
+    /// Only used in "assist" read_mode.
+    ///
+    /// With this, an ack-index register is written only by a tapped `MsgAppend`, so a switch
+    /// that reboots while the region is being read but not written to has its register sit at 0.
+    /// This makes switch-assisted reads fail, forwarding them all to the leader.
+    ///
+    /// A switch's register is per-region (slot = `region_id % 1024`),
+    /// unlike etcd's one-per-peer, so refreshing everything would be
+    /// O(peers x regions). This is armed only while
+    /// `micros_until_next_lease_expiry_timeout()` is `Some`, i.e. only on a
+    /// `GrantLeases` leader holding at least one live read lease.
+    fn schedule_switch_register_refresh_tick(&mut self) {
+        let idx = PeerTick::SwitchRegisterRefresh as usize;
+        if self.fsm.tick_registry[idx] {
+            return;
+        }
+        let refresher = match crate::store::global_switch_register_refresher() {
+            Some(r) => r,
+            // Not assist mode; nothing to refresh.
+            None => return,
+        };
+        // `None` = not a GrantLeases leader holding leases.
+        // This relies on micros_until_next_lease_expiry_timeout() checking leadership.
+        if self
+            .fsm
+            .peer
+            .raft_group
+            .micros_until_next_lease_expiry_timeout()
+            .is_none()
+        {
+            return;
+        }
+        let region_id = self.region_id();
+        let mb = match self.ctx.router.mailbox(region_id) {
+            Some(mb) => mb,
+            None => return,
+        };
+        self.fsm.tick_registry[idx] = true;
+        // Always re-arm, refresh_region() will no-op is the region has been updated.
+        // Placed after the mailbox lookup so a peer being destroyed (no
+        // mailbox, so no arming) cannot re-fire this on every `handle_msgs`.
+        // TODO: Is cancelling this timer when the UDP sidechannel outbound path sends an update reasonable?
+        refresher.refresh_region(region_id);
+        let peer_id = self.fsm.peer.peer_id();
+        let delay = self
+            .ctx
+            .timer
+            .delay(crate::store::SWITCH_REGISTER_REFRESH_INTERVAL)
+            .compat()
+            .map(move |_| {
+                if let Err(e) = mb.force_send(PeerMsg::Tick(PeerTick::SwitchRegisterRefresh)) {
+                    debug!(
+                        "failed to schedule switch register refresh tick";
+                        "region_id" => region_id,
+                        "peer_id" => peer_id,
+                        "err" => %e,
+                    );
+                }
+            });
+        poll_future_notify(delay);
+    }
+
+    fn switch_register_refresh_tick(&mut self) {
+        self.schedule_switch_register_refresh_tick();
+    }
+
     fn register_raft_base_tick(&mut self) {
         // If we register raft base tick failed, the whole raft can't run correctly,
         // TODO: shutdown the store?
@@ -2413,6 +2581,13 @@ where
         if self.fsm.peer.pending_remove {
             self.fsm.peer.mut_store().flush_entry_cache_metrics();
             return;
+        }
+
+        // Assist read_mode: expose raft-rs read-lease stats as Prometheus gauges.
+        if crate::store::global_switch_read_gate().is_some() {
+            let stats = self.fsm.peer.raft_group.status().read_lease_stats;
+            RAFT_TIMES_READ_LEASE_USED.set(stats.times_read_lease_used as i64);
+            RAFT_TIMES_GOT_READ_QUERY.set(stats.times_got_read_query as i64);
         }
 
         // Update the state whether the peer is pending on applying raft

@@ -781,11 +781,28 @@ where
     }
 
     fn get_call_option(&self) -> CallOption {
-        let mut metadata = MetadataBuilder::with_capacity(1);
+        let mut metadata = MetadataBuilder::with_capacity(3);
         let value = MetadataSourceStoreId::format(self.self_store_id);
         metadata
             .add_str(MetadataSourceStoreId::KEY, &value)
             .unwrap();
+        // Advertise this store's UDP sidechannel endpoint so the peer can dial
+        // us back for reflected switch responses (assist read_mode only). The peer's
+        // IP is recovered from the gRPC connection on the receive side.
+        if let Some(sc) = crate::server::udp_sidechannel::global_udp_sidechannel() {
+            metadata
+                .add_str(
+                    crate::server::udp_sidechannel::RAFT_SIDECHANNEL_PORT_KEY,
+                    &sc.listen_port().to_string(),
+                )
+                .unwrap();
+            metadata
+                .add_str(
+                    crate::server::udp_sidechannel::RAFT_SIDECHANNEL_MAGIC_KEY,
+                    &sc.magic_as_str(),
+                )
+                .unwrap();
+        }
         CallOption::default().headers(metadata.build())
     }
 }
@@ -1160,6 +1177,12 @@ where
     /// ensure all buffered messages are sent out.
     pub fn send(&mut self, msg: RaftMessage) -> result::Result<(), DiscardReason> {
         let store_id = msg.get_to_peer().store_id;
+
+        // Flow-1 tap: mirror index-advancing MsgAppend / MsgAskAckIndex to the
+        // P4 switch (assist mode only; a no-op otherwise). Non-blocking.
+        if let Some(sc) = crate::server::udp_sidechannel::global_udp_sidechannel() {
+            sc.process_outgoing_message(&msg);
+        }
         let grpc_raft_conn_num = self.builder.cfg.value().grpc_raft_conn_num as u64;
         let conn_id = if grpc_raft_conn_num == 1 {
             0
@@ -1251,6 +1274,11 @@ where
 
     /// Flushes all buffered messages.
     pub fn flush(&mut self) {
+        // Cadence hook for the UDP sidechannel (drains continuously via its own
+        // send loop, so this is a no-op today; kept for TCP-flush symmetry).
+        if let Some(sc) = crate::server::udp_sidechannel::global_udp_sidechannel() {
+            sc.flush();
+        }
         self.flush_full_metrics();
         if self.need_flush.is_empty() {
             return;

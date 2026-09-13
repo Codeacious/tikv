@@ -760,37 +760,45 @@ where
     cmd.set_header(header);
     cmd.set_requests(vec![req].into());
     let tracker = get_tls_tracker_token();
-    let store_cb = StoreCallback::read(Box::new(move |resp| {
-        let res = on_read_result(resp).map_err(Error::into);
-        if res.is_ok() {
-            let elapse = begin_instant.saturating_elapsed_secs();
-            GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
-                if tracker.metrics.read_index_propose_wait_nanos > 0 {
-                    ASYNC_REQUESTS_DURATIONS_VEC
-                        .snapshot_read_index_propose_wait
-                        .observe(
-                            tracker.metrics.read_index_propose_wait_nanos as f64 / 1_000_000_000.0,
-                        );
-                    // snapshot may be handled by lease read in raftstore
-                    if tracker.metrics.read_index_confirm_wait_nanos > 0 {
+    // Assist read_mode: lift the client's switch read-gate marker off the request
+    // body onto the callback, which is the one object that survives all the way
+    // into the raftstore read queue.
+    let read_gate_marker = crate::server::udp_sidechannel::read_gate_marker_from_ctx(ctx.pb_ctx);
+    let store_cb = StoreCallback::read_with_marker(
+        Box::new(move |resp| {
+            let res = on_read_result(resp).map_err(Error::into);
+            if res.is_ok() {
+                let elapse = begin_instant.saturating_elapsed_secs();
+                GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
+                    if tracker.metrics.read_index_propose_wait_nanos > 0 {
                         ASYNC_REQUESTS_DURATIONS_VEC
-                            .snapshot_read_index_confirm
+                            .snapshot_read_index_propose_wait
                             .observe(
-                                tracker.metrics.read_index_confirm_wait_nanos as f64
+                                tracker.metrics.read_index_propose_wait_nanos as f64
                                     / 1_000_000_000.0,
                             );
+                        // snapshot may be handled by lease read in raftstore
+                        if tracker.metrics.read_index_confirm_wait_nanos > 0 {
+                            ASYNC_REQUESTS_DURATIONS_VEC
+                                .snapshot_read_index_confirm
+                                .observe(
+                                    tracker.metrics.read_index_confirm_wait_nanos as f64
+                                        / 1_000_000_000.0,
+                                );
+                        }
+                    } else if tracker.metrics.local_read {
+                        ASYNC_REQUESTS_DURATIONS_VEC
+                            .snapshot_local_read
+                            .observe(elapse);
                     }
-                } else if tracker.metrics.local_read {
-                    ASYNC_REQUESTS_DURATIONS_VEC
-                        .snapshot_local_read
-                        .observe(elapse);
-                }
-            });
-            ASYNC_REQUESTS_DURATIONS_VEC.snapshot.observe(elapse);
-            ASYNC_REQUESTS_COUNTER_VEC.snapshot.success.inc();
-        }
-        cb(res);
-    }));
+                });
+                ASYNC_REQUESTS_DURATIONS_VEC.snapshot.observe(elapse);
+                ASYNC_REQUESTS_COUNTER_VEC.snapshot.success.inc();
+            }
+            cb(res);
+        }),
+        read_gate_marker,
+    );
 
     let read_ctx = ReadContext::new(ctx.read_id, ctx.start_ts.map(|ts| ts.into_inner()));
     if res.is_ok() {

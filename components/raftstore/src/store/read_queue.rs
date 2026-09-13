@@ -37,6 +37,14 @@ pub struct ReadIndexRequest<C> {
     pub locked: Option<Box<LockInfo>>,
     // `true` means it's in `ReadIndexQueue::reads`.
     in_contexts: bool,
+    /// Assist read_mode: the switch read-gate marker this read is waiting on.
+    pub read_gate_marker: u64,
+    /// Assist read_mode: the switch index this read's gate marker resolved with.
+    pub read_gate_resolved: Option<u64>,
+    /// Whether the index this read carries came from this follower's own read
+    /// lease rather than from the leader (raft-rs `ReadState::served_by_follower_lease`,
+    /// recorded in `advance_replica_reads`). Leader reads are not gated.
+    pub served_by_follower_lease: bool,
 
     cmds_heap_size: usize,
 }
@@ -66,6 +74,9 @@ impl<C> ReadIndexRequest<C> {
             addition_request: None,
             locked: None,
             in_contexts: false,
+            read_gate_marker: 0,
+            read_gate_resolved: None,
+            served_by_follower_lease: false,
             cmds_heap_size,
         }
     }
@@ -212,12 +223,13 @@ impl<C: ErrorCallback> ReadIndexQueue<C> {
         None
     }
 
+    /// The 4th tuple element (`served_by_follower_lease`) is ignored here: a leader answers its own reads.
     pub fn advance_leader_reads<T>(&mut self, states: T)
     where
-        T: IntoIterator<Item = (Uuid, Option<LockInfo>, u64)>,
+        T: IntoIterator<Item = (Uuid, Option<LockInfo>, u64, bool)>,
     {
         let mut states_iter = states.into_iter();
-        while let Some((uuid, info, index)) = states_iter.next() {
+        while let Some((uuid, info, index, _)) = states_iter.next() {
             let invalid_id = match self.reads.get_mut(self.ready_cnt) {
                 Some(r) if r.id == uuid => {
                     r.read_index = Some(index);
@@ -237,7 +249,7 @@ impl<C: ErrorCallback> ReadIndexQueue<C> {
                 expect_id_track.push((i, self.reads.get(i).map(|r| (r.id, r.propose_time))));
             }
             let mut actual_id_track = vec![(uuid, info.is_some(), index)];
-            for (id, info, index) in states_iter.take(20) {
+            for (id, info, index, _) in states_iter.take(20) {
                 actual_id_track.push((id, info.is_some(), index));
             }
             error!("context around"; "expect_id_track" => ?expect_id_track, "actual_id_track" => ?actual_id_track);
@@ -251,10 +263,10 @@ impl<C: ErrorCallback> ReadIndexQueue<C> {
     /// update the read index of the requests that before the specified id.
     pub fn advance_replica_reads<T>(&mut self, states: T)
     where
-        T: IntoIterator<Item = (Uuid, Option<LockInfo>, u64)>,
+        T: IntoIterator<Item = (Uuid, Option<LockInfo>, u64, bool)>,
     {
         let (mut min_changed_offset, mut max_changed_offset) = (usize::MAX, 0);
-        for (uuid, locked, index) in states {
+        for (uuid, locked, index, served_by_follower_lease) in states {
             if let Some(raw_offset) = self.contexts.remove(&uuid) {
                 let offset = match raw_offset.checked_sub(self.handled_cnt) {
                     Some(offset) => offset,
@@ -278,6 +290,7 @@ impl<C: ErrorCallback> ReadIndexQueue<C> {
                     }
                 }
                 self.reads[offset].read_index = Some(index);
+                self.reads[offset].served_by_follower_lease = served_by_follower_lease;
                 min_changed_offset = cmp::min(min_changed_offset, offset);
                 max_changed_offset = cmp::max(max_changed_offset, offset);
                 continue;
@@ -510,7 +523,7 @@ mod tests {
 
         // After the peer becomes leader, `advance` could be called before
         // `clear_uncommitted_on_role_change`.
-        queue.advance_leader_reads(vec![(id, None, 10)]);
+        queue.advance_leader_reads(vec![(id, None, 10, false)]);
         while let Some(mut read) = queue.pop_front() {
             read.cmds.clear();
         }
@@ -525,14 +538,14 @@ mod tests {
         );
         queue.push_back(req, true);
         let last_id = queue.reads.back().map(|t| t.id).unwrap();
-        queue.advance_leader_reads(vec![(last_id, None, 10)]);
+        queue.advance_leader_reads(vec![(last_id, None, 10, false)]);
         assert_eq!(queue.ready_cnt, 1);
         while let Some(mut read) = queue.pop_front() {
             read.cmds.clear();
         }
 
         // Shouldn't panic when call `advance_replica_reads` with `id` again.
-        queue.advance_replica_reads(vec![(id, None, 10)]);
+        queue.advance_replica_reads(vec![(id, None, 10, false)]);
     }
 
     #[test]
@@ -554,7 +567,7 @@ mod tests {
 
         // Advance on leader, but the peer is not ready to handle it (e.g. it's in
         // merging).
-        queue.advance_leader_reads(vec![(id, None, 10)]);
+        queue.advance_leader_reads(vec![(id, None, 10, false)]);
 
         // The leader steps down to follower, clear uncommitted reads.
         queue.clear_uncommitted_on_role_change(10);
@@ -571,7 +584,7 @@ mod tests {
         queue.push_back(req, true);
 
         // Advance on leader again, shouldn't panic.
-        queue.advance_leader_reads(vec![(id_1, None, 10)]);
+        queue.advance_leader_reads(vec![(id_1, None, 10, false)]);
         while let Some(mut read) = queue.pop_front() {
             read.cmds.clear();
         }
@@ -596,12 +609,12 @@ mod tests {
             queue.push_back(req, false);
         }
 
-        queue.advance_replica_reads(vec![(ids[1], None, 100)]);
+        queue.advance_replica_reads(vec![(ids[1], None, 100, false)]);
         assert_eq!(queue.ready_cnt, 2);
         while let Some(mut read) = queue.pop_front() {
             read.cmds.clear();
         }
 
-        queue.advance_replica_reads(vec![(ids[0], None, 100)]);
+        queue.advance_replica_reads(vec![(ids[0], None, 100, false)]);
     }
 }

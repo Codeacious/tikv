@@ -133,7 +133,8 @@ impl<EK: KvEngine, ER: RaftEngine> Peer<EK, ER> {
             .get_mut(0)
             .filter(|req| req.has_read_index())
             .map(|req| req.take_read_index());
-        let (id, dropped) = propose_read_index(self.raft_group_mut(), request.as_ref());
+        let region_id = self.region_id();
+        let (id, dropped) = propose_read_index(self.raft_group_mut(), request.as_ref(), region_id);
         if dropped {
             // The message gets dropped silently, can't be handled anymore.
             notify_stale_req(self.term(), ch);

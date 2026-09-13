@@ -789,6 +789,38 @@ lazy_static! {
             "Pending read index count."
         ).unwrap();
 
+    // "Assist" read_mode gauges.
+    // These two mirror the cumulative counters raft-rs maintains in ReadLeaseStats.
+    // Unlabelled, so with several regions per store, each region's tick overwrites the last;
+    // the value is whichever region ticked most recently, and raft-rs zeroes the
+    // underlying counters on term changes.
+    // TODO: Treat as a debug indicator only until labelled by region or summed.
+    pub static ref RAFT_TIMES_READ_LEASE_USED: IntGauge =
+        register_int_gauge!(
+            "tikv_raftstore_times_read_lease_used",
+            "Cumulative follower reads served locally under a read lease (from raft)."
+        ).unwrap();
+
+    pub static ref RAFT_TIMES_GOT_READ_QUERY: IntGauge =
+        register_int_gauge!(
+            "tikv_raftstore_times_got_read_query",
+            "Cumulative read-index queries observed by the read-lease leader (from raft)."
+        ).unwrap();
+
+    pub static ref SIDECHANNEL_MSG_SENT_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "tikv_raftstore_sidechannel_msg_sent_total",
+            "Total UDP sidechannel messages emitted, by raft message type.",
+            &["msg_type"]
+        ).unwrap();
+
+    pub static ref SIDECHANNEL_READ_GATE_WAIT_DURATION: Histogram =
+        register_histogram!(
+            "tikv_raftstore_sidechannel_read_gate_wait_duration_seconds",
+            "Wall time a marked follower read waited on the switch read gate.",
+            exponential_buckets(1e-5, 2.0, 20).unwrap()
+        ).unwrap();
+
     pub static ref READ_QPS_TOPN: GaugeVec =
         register_gauge_vec!(
             "tikv_read_qps_topn",

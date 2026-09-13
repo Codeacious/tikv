@@ -517,12 +517,19 @@ pub struct ReadyResult {
 pub fn propose_read_index<T: raft::Storage>(
     raft_group: &mut RawNode<T>,
     request: Option<&raft_cmdpb::ReadIndexRequest>,
+    region_id: u64,
 ) -> (Uuid, bool) {
     let last_pending_read_count = raft_group.raft.pending_read_count();
     let last_ready_read_count = raft_group.raft.ready_read_count();
 
     let id = Uuid::new_v4();
-    raft_group.read_index(ReadIndexContext::fields_to_bytes(id, request, None));
+    let rctx = ReadIndexContext::fields_to_bytes(id, request, None);
+    // Assist read_mode (Flow 2): stamp the read-index with this region's switch's saved ack-index
+    // so a serving follower can wait for proposed but yet-uncommitted log entries.
+    match crate::store::global_switch_read_gate() {
+        Some(gate) => raft_group.read_index_switch_hint(rctx, gate.read_index_hint(region_id)),
+        None => raft_group.read_index(rctx),
+    }
 
     let pending_read_count = raft_group.raft.pending_read_count();
     let ready_read_count = raft_group.raft.ready_read_count();
@@ -981,7 +988,9 @@ where
 
         let read_only_option = match cfg.read_mode.as_str() {
             "lease-based" => raft::ReadOnlyOption::LeaseBased,
-            "grant-leases" => raft::ReadOnlyOption::GrantLeases,
+            // "assist" is "grant-leases" plus the P4 UDP sidechannel; the raft
+            // read-lease behavior is identical, so both map to GrantLeases.
+            "grant-leases" | "assist" => raft::ReadOnlyOption::GrantLeases,
             // Anything else will be treated as "safe"
             _ => raft::ReadOnlyOption::Safe,
         };
@@ -3654,7 +3663,79 @@ where
                 && read.cmds()[0].0.get_requests().len() == 1
                 && read.cmds()[0].0.get_requests()[0].get_cmd_type() == CmdType::ReadIndex;
 
+            // Assist read_mode follower read gate.
+            // On a lease-holding follower, hold a marked read until the switch has given
+            // its current saved ack-index for that read's marker.
+            // The read is then served at or above the log index the switch answered with.
+            // Non-blocking: on a miss re-queue and retry next poll rather than parking the
+            // poller. Skipped once resolved, so requeuing doesn't trigger a second switch query.
+            // Only a read whose index came from a follower lease is gated; leader-forwarded reads
+            // must not be gated (leader reads are always linearized with or without a switch answer).
+            if self.raft_group.is_asking_for_read_lease()
+                && read.served_by_follower_lease
+                && read.read_gate_resolved.is_none()
+                && let Some(gate) = crate::store::global_switch_read_gate()
+            {
+                // Use a client-minted marker if provided, and fall back to a
+                // stable server-minted marker if not. Stored on the read itself, so a
+                // it keeps the same marker across reenqueues.
+                let client_marker = read
+                    .cmds()
+                    .first()
+                    .map(|(_, cb, _)| cb.read_gate_marker())
+                    .unwrap_or(0);
+                let marker = if client_marker != 0 {
+                    client_marker
+                } else {
+                    if read.read_gate_marker == 0 {
+                        read.read_gate_marker = gate.mint_server_marker();
+                    }
+                    read.read_gate_marker
+                };
+                // Reuse the poll batch's cached clock read rather than sampling the clock every time.
+                let now = *ctx.current_time.get_or_insert_with(monotonic_raw_now);
+                let waited = (now - read.propose_time).to_std().unwrap_or_default();
+                match gate.poll_read_gate(marker, self.region_id, waited >= crate::store::READ_GATE_GIVE_UP) {
+                    crate::store::ReadGatePoll::Resolved(switch_index) => {
+                        // Record how long this read waited on the switch gate.
+                        SIDECHANNEL_READ_GATE_WAIT_DURATION.observe(duration_to_sec(waited));
+                        read.read_gate_resolved = Some(switch_index);
+                    }
+                    crate::store::ReadGatePoll::Pending => {
+                        self.pending_reads.push_front(read);
+                        break;
+                    }
+                    crate::store::ReadGatePoll::GiveUp => {
+                        // Persistent sidechannel loss (e.g. the switch is down):
+                        // fail the read cleanly instead of gating it forever. The
+                        // client retries, same as the applied-index-lag path below.
+                        warn!(
+                            "switch read gate timed out, failing replica read";
+                            "region_id" => self.region_id,
+                            "peer_id" => self.peer_id(),
+                            "marker" => marker,
+                        );
+                        let mut response = cmd_resp::new_error(Error::ReadIndexNotReady {
+                            region_id: self.region_id,
+                            reason: "switch read gate timed out",
+                        });
+                        cmd_resp::bind_term(&mut response, self.term());
+                        self.respond_replica_read_error(&mut read, response);
+                        continue;
+                    }
+                }
+            }
+
+            // The switch's answer may actually be lower than what the follower actually holds;
+            // we need the max of both to handle both cases (follower ahead or switch ahead).
+            if let Some(switch_index) = read.read_gate_resolved
+                && switch_index > read.read_index.unwrap()
+            {
+                read.read_index = Some(switch_index);
+            }
+
             let read_index = read.read_index.unwrap();
+
             if is_read_index_request {
                 self.response_read(&mut read, ctx, false);
             } else if self.ready_to_handle_unsafe_replica_read(read_index) {
@@ -3710,7 +3791,13 @@ where
         let mut propose_time = None;
         let states = ready.read_states().iter().map(|state| {
             let read_index_ctx = ReadIndexContext::parse(state.request_ctx.as_slice()).unwrap();
-            (read_index_ctx.id, read_index_ctx.locked, state.index)
+            (
+                read_index_ctx.id,
+                read_index_ctx.locked,
+                state.index,
+                // Carried only for a follower's assist gate
+                state.served_by_follower_lease,
+            )
         });
         // The follower may lost `ReadIndexResp`, so the pending_reads does not
         // guarantee the orders are consistent with read_states. `advance` will
@@ -4384,7 +4471,7 @@ where
         &mut self,
         request: Option<&raft_cmdpb::ReadIndexRequest>,
     ) -> (Uuid, bool) {
-        propose_read_index(&mut self.raft_group, request)
+        propose_read_index(&mut self.raft_group, request, self.region_id)
     }
 
     /// Returns (minimal matched, minimal committed_index)

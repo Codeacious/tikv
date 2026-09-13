@@ -100,6 +100,11 @@ pub enum Callback<S: Snapshot> {
         cb: BoxReadCallback<S>,
 
         tracker: TrackerToken,
+
+        /// Assist read_mode: the client-minted switch read-gate marker this read is
+        /// waiting on, taken from the request body (`kvrpcpb::Context`) at the
+        /// `raftkv` boundary. `0` = no client marker.
+        read_gate_marker: u64,
     },
     /// Write callback.
     Write {
@@ -129,7 +134,22 @@ where
 {
     pub fn read(cb: BoxReadCallback<S>) -> Self {
         let tracker = get_tls_tracker_token();
-        Callback::Read { cb, tracker }
+        Callback::Read {
+            cb,
+            tracker,
+            read_gate_marker: 0,
+        }
+    }
+
+    /// Like [`Callback::read`], but carries a client-minted switch read-gate
+    /// marker (assist mode). `marker == 0` is identical to `read`.
+    pub fn read_with_marker(cb: BoxReadCallback<S>, marker: u64) -> Self {
+        let tracker = get_tls_tracker_token();
+        Callback::Read {
+            cb,
+            tracker,
+            read_gate_marker: marker,
+        }
     }
 
     pub fn write(cb: BoxWriteCallback) -> Self {
@@ -223,6 +243,15 @@ pub trait ReadCallback: ErrorCallback {
 
     fn set_result(self, result: Self::Response);
     fn read_tracker(&self) -> Option<TrackerToken>;
+
+    /// Assist mode: the client-minted switch read-gate marker carried on this
+    /// read, or `0` when the client minted none (the serve gate then falls back
+    /// to a server-minted marker kept on the `ReadIndexRequest`). Defaults to
+    /// `0` so callback types outside the v1 rawkv read path — raftstore-v2's
+    /// `QueryResChannel` in particular — are unaffected.
+    fn read_gate_marker(&self) -> u64 {
+        0
+    }
 }
 
 pub trait WriteCallback: ErrorCallback {
@@ -275,6 +304,16 @@ impl<S: Snapshot> ReadCallback for Callback<S> {
             return None;
         };
         Some(*tracker)
+    }
+
+    fn read_gate_marker(&self) -> u64 {
+        let Callback::Read {
+            read_gate_marker, ..
+        } = self
+        else {
+            return 0;
+        };
+        *read_gate_marker
     }
 }
 
@@ -403,6 +442,9 @@ pub enum PeerTick {
     RequestSnapshot = 12,
     RequestVoterReplicatedIndex = 13,
     ReadIndexDelayGiveUp = 14,
+    ReadLeaseRenew = 15,
+    ReadLeaseExpiry = 16,
+    SwitchRegisterRefresh = 17,
 }
 
 impl PeerTick {
@@ -426,6 +468,9 @@ impl PeerTick {
             PeerTick::RequestSnapshot => "request_snapshot",
             PeerTick::RequestVoterReplicatedIndex => "request_voter_replicated_index",
             PeerTick::ReadIndexDelayGiveUp => "read_index_delay_give_up",
+            PeerTick::ReadLeaseRenew => "read_lease_renew",
+            PeerTick::ReadLeaseExpiry => "read_lease_expiry",
+            PeerTick::SwitchRegisterRefresh => "switch_register_refresh",
         }
     }
 
@@ -446,6 +491,9 @@ impl PeerTick {
             PeerTick::RequestSnapshot,
             PeerTick::RequestVoterReplicatedIndex,
             PeerTick::ReadIndexDelayGiveUp,
+            PeerTick::ReadLeaseRenew,
+            PeerTick::ReadLeaseExpiry,
+            PeerTick::SwitchRegisterRefresh,
         ];
         TICKS
     }

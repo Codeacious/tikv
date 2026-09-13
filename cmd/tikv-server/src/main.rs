@@ -83,8 +83,29 @@ fn main() {
                 .long("read-mode")
                 .takes_value(true)
                 .value_name("MODE")
-                .possible_values(&["safe", "lease-based", "grant-leases"])
+                .possible_values(&["safe", "lease-based", "grant-leases", "assist"])
                 .help("Set the raft read consistency mode"),
+        )
+        .arg(
+            Arg::with_name("udp-sidechannel-ip")
+                .long("udp-sidechannel-ip")
+                .takes_value(true)
+                .value_name("IP")
+                .help("Set the UDP sidechannel listen IP"),
+        )
+        .arg(
+            Arg::with_name("udp-sidechannel-port")
+                .long("udp-sidechannel-port")
+                .takes_value(true)
+                .value_name("PORT")
+                .help("Set the UDP sidechannel listen port"),
+        )
+        .arg(
+            Arg::with_name("udp-sidechannel-magic")
+                .long("udp-sidechannel-magic")
+                .takes_value(true)
+                .value_name("HEX")
+                .help("Set the UDP sidechannel 16-bit magic (hex, e.g. BEEF)"),
         )
         .arg(
             Arg::with_name("advertise-addr")

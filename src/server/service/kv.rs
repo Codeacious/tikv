@@ -217,6 +217,63 @@ impl<E: Engine, L: LockManager, F: KvFormat> Service<E, L, F> {
         }
         None
     }
+
+    /// Extracts the peer's UDP sidechannel `(port, magic)` from the raft-stream
+    /// metadata handshake (assist read_mode). `None` if either header is absent.
+    fn get_sidechannel_endpoint_from_metadata(ctx: &RpcContext<'_>) -> Option<(u16, u16)> {
+        use crate::server::udp_sidechannel::{
+            RAFT_SIDECHANNEL_MAGIC_KEY, RAFT_SIDECHANNEL_PORT_KEY,
+        };
+        let metadata = ctx.request_headers();
+        let mut port = None;
+        let mut magic = None;
+        for i in 0..metadata.len() {
+            let (key, value) = metadata.get(i).unwrap();
+            if key == RAFT_SIDECHANNEL_PORT_KEY {
+                port = std::str::from_utf8(value).ok().and_then(|s| s.parse::<u16>().ok());
+            } else if key == RAFT_SIDECHANNEL_MAGIC_KEY {
+                magic = std::str::from_utf8(value)
+                    .ok()
+                    .and_then(crate::server::udp_sidechannel::UdpSidechannel::magic_from_str);
+            }
+        }
+        match (port, magic) {
+            (Some(p), Some(m)) => Some((p, m)),
+            _ => None,
+        }
+    }
+
+    /// Recovers the peer's IP from the gRPC connection string
+    fn peer_ip_from_ctx(ctx: &RpcContext<'_>) -> Option<String> {
+        let peer = ctx.peer();
+        let rest = peer
+            .strip_prefix("ipv4:")
+            .or_else(|| peer.strip_prefix("ipv6:"))
+            .unwrap_or(&peer);
+        let idx = rest.rfind(':')?;
+        let ip = &rest[..idx];
+        Some(ip.trim_start_matches('[').trim_end_matches(']').to_owned())
+    }
+
+    /// Attaches the source peer's sidechannel endpoint (refcounted) for the life
+    /// of a raft gRPC stream, returning a `(handle, store_id)` guard to detach
+    /// with when the stream ends. No-op / `None` outside assist read_mode.
+    fn attach_sidechannel_peer(
+        ctx: &RpcContext<'_>,
+        source_store_id: Option<u64>,
+    ) -> Option<(Arc<crate::server::udp_sidechannel::UdpSidechannel>, u64)> {
+        let sid = source_store_id?;
+        let sc = crate::server::udp_sidechannel::global_udp_sidechannel()?;
+        let (port, magic) = Self::get_sidechannel_endpoint_from_metadata(ctx)?;
+        let ip = Self::peer_ip_from_ctx(ctx)?;
+        // Only hand back a detach guard if the peer was actually counted —
+        // `attach_peer` bails without counting on an unparseable address, and
+        // detaching that would decrement another live stream's refcount.
+        if !sc.attach_peer(sid, &ip, port, magic) {
+            return None;
+        }
+        Some((sc.clone(), sid))
+    }
 }
 
 macro_rules! reject_if_cluster_id_mismatch {
@@ -749,6 +806,9 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         let source_store_id = Self::get_store_id_from_metadata(&ctx);
         let message_received =
             source_store_id.map(|x| MESSAGE_RECV_BY_STORE.with_label_values(&[&format!("{}", x)]));
+        // Learn the source peer's UDP sidechannel endpoint (assist mode); held
+        // for the life of the stream and detached below.
+        let sidechannel_peer = Self::attach_sidechannel_peer(&ctx, source_store_id);
         info!(
             "raft RPC is called, new gRPC stream established";
             "source_store_id" => ?source_store_id,
@@ -786,6 +846,9 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
                 }
                 Ok(_) => RpcStatus::new(RpcStatusCode::UNKNOWN),
             };
+            if let Some((sc, sid)) = sidechannel_peer {
+                sc.detach_peer(sid);
+            }
             let _ = sink
                 .fail(status)
                 .map_err(|e| error!("KvService::raft send response fail"; "err" => ?e))
@@ -802,6 +865,7 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
         let source_store_id = Self::get_store_id_from_metadata(&ctx);
         let message_received =
             source_store_id.map(|x| MESSAGE_RECV_BY_STORE.with_label_values(&[&format!("{}", x)]));
+        let sidechannel_peer = Self::attach_sidechannel_peer(&ctx, source_store_id);
         info!(
             "batch_raft RPC is called, new gRPC stream established";
             "source_store_id" => ?source_store_id,
@@ -844,6 +908,9 @@ impl<E: Engine, L: LockManager, F: KvFormat> Tikv for Service<E, L, F> {
                 }
                 Ok(_) => RpcStatus::new(RpcStatusCode::UNKNOWN),
             };
+            if let Some((sc, sid)) = sidechannel_peer {
+                sc.detach_peer(sid);
+            }
             let _ = sink
                 .fail(status)
                 .map_err(|e| warn!("KvService::batch_raft send response fail"; "err" => ?e))

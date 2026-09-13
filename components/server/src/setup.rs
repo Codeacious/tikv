@@ -257,6 +257,22 @@ pub fn overwrite_config_with_cmd_args(config: &mut TikvConfig, matches: &ArgMatc
         config.raft_store.read_mode = read_mode.to_owned();
     }
 
+    if let Some(ip) = matches.value_of("udp-sidechannel-ip") {
+        config.raft_store.udp_sidechannel_ip = ip.to_owned();
+    }
+
+    if let Some(port) = matches.value_of("udp-sidechannel-port") {
+        if let Ok(port) = port.parse::<u16>() {
+            config.raft_store.udp_sidechannel_port = port;
+        }
+    }
+
+    if let Some(magic) = matches.value_of("udp-sidechannel-magic") {
+        if let Ok(magic) = u16::from_str_radix(magic, 16) {
+            config.raft_store.udp_sidechannel_magic = magic;
+        }
+    }
+
     if let Some(advertise_addr) = matches.value_of("advertise-addr") {
         config.server.advertise_addr = advertise_addr.to_owned();
     }
