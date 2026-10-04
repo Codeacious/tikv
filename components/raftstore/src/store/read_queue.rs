@@ -223,6 +223,18 @@ impl<C: ErrorCallback> ReadIndexQueue<C> {
         None
     }
 
+    /// The latest `propose_time` among the ready reads whose ids are in `ids`.
+    /// Used to renew the leader lease only from reads a heartbeat quorum
+    /// confirmed, not ones raft served from its own self-lease.
+    pub fn last_ready_propose_time_among(&self, ids: &[Uuid]) -> Option<Timespec> {
+        self.reads
+            .iter()
+            .take(self.ready_cnt)
+            .rev()
+            .find(|r| ids.contains(&r.id))
+            .map(|r| r.propose_time)
+    }
+
     /// The 4th tuple element (`served_by_follower_lease`) is ignored here: a leader answers its own reads.
     pub fn advance_leader_reads<T>(&mut self, states: T)
     where

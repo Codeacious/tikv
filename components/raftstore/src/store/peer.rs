@@ -519,16 +519,34 @@ pub fn propose_read_index<T: raft::Storage>(
     request: Option<&raft_cmdpb::ReadIndexRequest>,
     region_id: u64,
 ) -> (Uuid, bool) {
+    propose_read_index_with_quorum(raft_group, request, region_id, false)
+}
+
+/// Like `propose_read_index`, but with `force_quorum` a leader under a leased
+/// read mode confirms the read with a heartbeat quorum round instead of serving
+/// it from raft's self-lease (`RawNode::read_index_quorum`). Only a leader can
+/// honour it; the switch hint only matters to a serving follower, so a forced
+/// read carries none.
+pub fn propose_read_index_with_quorum<T: raft::Storage>(
+    raft_group: &mut RawNode<T>,
+    request: Option<&raft_cmdpb::ReadIndexRequest>,
+    region_id: u64,
+    force_quorum: bool,
+) -> (Uuid, bool) {
     let last_pending_read_count = raft_group.raft.pending_read_count();
     let last_ready_read_count = raft_group.raft.ready_read_count();
 
     let id = Uuid::new_v4();
     let rctx = ReadIndexContext::fields_to_bytes(id, request, None);
-    // Assist read_mode (Flow 2): stamp the read-index with this region's switch's saved ack-index
-    // so a serving follower can wait for proposed but yet-uncommitted log entries.
-    match crate::store::global_switch_read_gate() {
-        Some(gate) => raft_group.read_index_switch_hint(rctx, gate.read_index_hint(region_id)),
-        None => raft_group.read_index(rctx),
+    if force_quorum && raft_group.raft.state == raft::StateRole::Leader {
+        raft_group.read_index_quorum(rctx);
+    } else {
+        // Assist read_mode (Flow 2): stamp the read-index with this region's switch's saved
+        // ack-index so a serving follower can wait for proposed but yet-uncommitted log entries.
+        match crate::store::global_switch_read_gate() {
+            Some(gate) => raft_group.read_index_switch_hint(rctx, gate.read_index_hint(region_id)),
+            None => raft_group.read_index(rctx),
+        }
     }
 
     let pending_read_count = raft_group.raft.pending_read_count();
@@ -3810,8 +3828,27 @@ where
             self.pending_reads.advance_replica_reads(states);
             self.post_pending_read_index_on_replica(ctx);
         } else {
+            // The leader lease below is renewed from a read's propose time, which
+            // is only sound if a heartbeat quorum confirmed this leader after
+            // that moment. A read raft served from its self-lease (leased
+            // read modes) contacted nobody: its evidence can be up to one raft
+            // read-lease duration older than the read. So renew only from
+            // quorum-confirmed reads; under `safe` that is every read, exactly
+            // as before.
+            let confirmed: Vec<Uuid> = ready
+                .read_states()
+                .iter()
+                .filter(|s| !s.served_by_leader_lease)
+                .map(|s| {
+                    ReadIndexContext::parse(s.request_ctx.as_slice())
+                        .unwrap()
+                        .id
+                })
+                .collect();
             self.pending_reads.advance_leader_reads(states);
-            propose_time = self.pending_reads.last_ready().map(|r| r.propose_time);
+            propose_time = self
+                .pending_reads
+                .last_ready_propose_time_among(&confirmed);
             if self.ready_to_handle_read() {
                 while let Some(mut read) = self.pending_reads.pop_front() {
                     self.response_read(&mut read, ctx, false);
@@ -4423,7 +4460,11 @@ where
             .get_mut(0)
             .filter(|req| req.has_read_index())
             .map(|req| req.take_read_index());
-        let (id, dropped) = self.propose_read_index(request.as_ref());
+        // `read_quorum` asks for a read confirmed by a heartbeat quorum round.
+        // raftstore's lease renewal relies on it (`try_renew_leader_lease`),
+        // so raft must not answer it from its own self-lease.
+        let force_quorum = req.get_header().get_read_quorum();
+        let (id, dropped) = self.propose_read_index(request.as_ref(), force_quorum);
         if dropped && self.is_leader() {
             // The message gets dropped silently, can't be handled anymore.
             apply::notify_stale_req(self.term(), cb);
@@ -4470,8 +4511,9 @@ where
     pub fn propose_read_index(
         &mut self,
         request: Option<&raft_cmdpb::ReadIndexRequest>,
+        force_quorum: bool,
     ) -> (Uuid, bool) {
-        propose_read_index(&mut self.raft_group, request, self.region_id)
+        propose_read_index_with_quorum(&mut self.raft_group, request, self.region_id, force_quorum)
     }
 
     /// Returns (minimal matched, minimal committed_index)
