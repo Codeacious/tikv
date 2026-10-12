@@ -45,6 +45,12 @@ pub struct ReadIndexRequest<C> {
     /// lease rather than from the leader (raft-rs `ReadState::served_by_follower_lease`,
     /// recorded in `advance_replica_reads`). Leader reads are not gated.
     pub served_by_follower_lease: bool,
+    /// The raft term the `ReadState` that set `read_index` was produced in
+    /// (raft-rs `ReadState::term`, recorded in `advance_replica_reads` together
+    /// with `read_index` and `served_by_follower_lease`). Assist read_mode
+    /// applies the read's switch floor only if its stamp was taken in this term
+    /// (SAFE-1). 0 until a replica `ReadState` arrives; unused on leaders.
+    pub read_state_term: u64,
 
     cmds_heap_size: usize,
 }
@@ -77,6 +83,7 @@ impl<C> ReadIndexRequest<C> {
             read_gate_marker: 0,
             read_gate_resolved: None,
             served_by_follower_lease: false,
+            read_state_term: 0,
             cmds_heap_size,
         }
     }
@@ -235,13 +242,14 @@ impl<C: ErrorCallback> ReadIndexQueue<C> {
             .map(|r| r.propose_time)
     }
 
-    /// The 4th tuple element (`served_by_follower_lease`) is ignored here: a leader answers its own reads.
+    /// The 4th and 5th tuple elements (`served_by_follower_lease`, the
+    /// `ReadState` term) are ignored here: a leader answers its own reads.
     pub fn advance_leader_reads<T>(&mut self, states: T)
     where
-        T: IntoIterator<Item = (Uuid, Option<LockInfo>, u64, bool)>,
+        T: IntoIterator<Item = (Uuid, Option<LockInfo>, u64, bool, u64)>,
     {
         let mut states_iter = states.into_iter();
-        while let Some((uuid, info, index, _)) = states_iter.next() {
+        while let Some((uuid, info, index, ..)) = states_iter.next() {
             let invalid_id = match self.reads.get_mut(self.ready_cnt) {
                 Some(r) if r.id == uuid => {
                     r.read_index = Some(index);
@@ -261,7 +269,7 @@ impl<C: ErrorCallback> ReadIndexQueue<C> {
                 expect_id_track.push((i, self.reads.get(i).map(|r| (r.id, r.propose_time))));
             }
             let mut actual_id_track = vec![(uuid, info.is_some(), index)];
-            for (id, info, index, _) in states_iter.take(20) {
+            for (id, info, index, ..) in states_iter.take(20) {
                 actual_id_track.push((id, info.is_some(), index));
             }
             error!("context around"; "expect_id_track" => ?expect_id_track, "actual_id_track" => ?actual_id_track);
@@ -273,12 +281,16 @@ impl<C: ErrorCallback> ReadIndexQueue<C> {
     }
 
     /// update the read index of the requests that before the specified id.
+    ///
+    /// Each state is `(id, locked, index, served_by_follower_lease, term)`; the
+    /// last two describe the raft-rs `ReadState` and are recorded with the
+    /// index they came with.
     pub fn advance_replica_reads<T>(&mut self, states: T)
     where
-        T: IntoIterator<Item = (Uuid, Option<LockInfo>, u64, bool)>,
+        T: IntoIterator<Item = (Uuid, Option<LockInfo>, u64, bool, u64)>,
     {
         let (mut min_changed_offset, mut max_changed_offset) = (usize::MAX, 0);
-        for (uuid, locked, index, served_by_follower_lease) in states {
+        for (uuid, locked, index, served_by_follower_lease, term) in states {
             if let Some(raw_offset) = self.contexts.remove(&uuid) {
                 let offset = match raw_offset.checked_sub(self.handled_cnt) {
                     Some(offset) => offset,
@@ -303,6 +315,7 @@ impl<C: ErrorCallback> ReadIndexQueue<C> {
                 }
                 self.reads[offset].read_index = Some(index);
                 self.reads[offset].served_by_follower_lease = served_by_follower_lease;
+                self.reads[offset].read_state_term = term;
                 min_changed_offset = cmp::min(min_changed_offset, offset);
                 max_changed_offset = cmp::max(max_changed_offset, offset);
                 continue;
@@ -535,7 +548,7 @@ mod tests {
 
         // After the peer becomes leader, `advance` could be called before
         // `clear_uncommitted_on_role_change`.
-        queue.advance_leader_reads(vec![(id, None, 10, false)]);
+        queue.advance_leader_reads(vec![(id, None, 10, false, 0)]);
         while let Some(mut read) = queue.pop_front() {
             read.cmds.clear();
         }
@@ -550,14 +563,14 @@ mod tests {
         );
         queue.push_back(req, true);
         let last_id = queue.reads.back().map(|t| t.id).unwrap();
-        queue.advance_leader_reads(vec![(last_id, None, 10, false)]);
+        queue.advance_leader_reads(vec![(last_id, None, 10, false, 0)]);
         assert_eq!(queue.ready_cnt, 1);
         while let Some(mut read) = queue.pop_front() {
             read.cmds.clear();
         }
 
         // Shouldn't panic when call `advance_replica_reads` with `id` again.
-        queue.advance_replica_reads(vec![(id, None, 10, false)]);
+        queue.advance_replica_reads(vec![(id, None, 10, false, 0)]);
     }
 
     #[test]
@@ -579,7 +592,7 @@ mod tests {
 
         // Advance on leader, but the peer is not ready to handle it (e.g. it's in
         // merging).
-        queue.advance_leader_reads(vec![(id, None, 10, false)]);
+        queue.advance_leader_reads(vec![(id, None, 10, false, 0)]);
 
         // The leader steps down to follower, clear uncommitted reads.
         queue.clear_uncommitted_on_role_change(10);
@@ -596,7 +609,7 @@ mod tests {
         queue.push_back(req, true);
 
         // Advance on leader again, shouldn't panic.
-        queue.advance_leader_reads(vec![(id_1, None, 10, false)]);
+        queue.advance_leader_reads(vec![(id_1, None, 10, false, 0)]);
         while let Some(mut read) = queue.pop_front() {
             read.cmds.clear();
         }
@@ -621,12 +634,51 @@ mod tests {
             queue.push_back(req, false);
         }
 
-        queue.advance_replica_reads(vec![(ids[1], None, 100, false)]);
+        queue.advance_replica_reads(vec![(ids[1], None, 100, false, 0)]);
         assert_eq!(queue.ready_cnt, 2);
         while let Some(mut read) = queue.pop_front() {
             read.cmds.clear();
         }
 
-        queue.advance_replica_reads(vec![(ids[0], None, 100, false)]);
+        queue.advance_replica_reads(vec![(ids[0], None, 100, false, 0)]);
+    }
+
+    /// SAFE-1: a replica read records the term of the `ReadState` that set its
+    /// index, together with its provenance, so the assist gate can check the
+    /// read's own stamp term against it.
+    #[test]
+    fn test_advance_replica_reads_records_read_state_term() {
+        let mut queue = ReadIndexQueue::<Callback<KvTestSnapshot>> {
+            handled_cnt: 100,
+            ..Default::default()
+        };
+        let ids: [Uuid; 2] = [Uuid::new_v4(), Uuid::new_v4()];
+        for id in &ids {
+            let req = ReadIndexRequest::with_command(
+                *id,
+                RaftCmdRequest::default(),
+                Callback::None,
+                Timespec::new(0, 0),
+            );
+            queue.push_back(req, false);
+        }
+        assert_eq!(queue.reads[0].read_state_term, 0);
+
+        // One read served from this follower's lease in term 7, the other
+        // answered by the leader in term 8.
+        queue.advance_replica_reads(vec![
+            (ids[0], None, 50, true, 7),
+            (ids[1], None, 60, false, 8),
+        ]);
+        let got: Vec<_> = queue
+            .reads
+            .iter()
+            .map(|r| (r.read_index, r.served_by_follower_lease, r.read_state_term))
+            .collect();
+        assert_eq!(got, vec![(Some(50), true, 7), (Some(60), false, 8)]);
+
+        while let Some(mut read) = queue.pop_front() {
+            read.cmds.clear();
+        }
     }
 }

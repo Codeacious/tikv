@@ -543,8 +543,13 @@ pub fn propose_read_index_with_quorum<T: raft::Storage>(
     } else {
         // Assist read_mode (Flow 2): stamp the read-index with this region's switch's saved
         // ack-index so a serving follower can wait for proposed but yet-uncommitted log entries.
+        // The hint carries the term the switch stamped it in; raft-rs uses
+        // it only in that term and forwards the read otherwise (SAFE-1).
         match crate::store::global_switch_read_gate() {
-            Some(gate) => raft_group.read_index_switch_hint(rctx, gate.read_index_hint(region_id)),
+            Some(gate) => {
+                let (hint, hint_term) = gate.read_index_hint(region_id);
+                raft_group.read_index_switch_hint(rctx, hint, hint_term)
+            }
             None => raft_group.read_index(rctx),
         }
     }
@@ -3684,7 +3689,10 @@ where
             // Assist read_mode follower read gate.
             // On a lease-holding follower, hold a marked read until the switch has given
             // its current saved ack-index for that read's marker.
-            // The read is then served at or above the log index the switch answered with.
+            // The read is then served at or above the log index the switch answered with,
+            // provided the switch stamped that index in the term raft served
+            // the read in (SAFE-1); a stamp from any other term fails the read
+            // like a give-up.
             // Non-blocking: on a miss re-queue and retry next poll rather than parking the
             // poller. Skipped once resolved, so requeuing doesn't trigger a second switch query.
             // Only a read whose index came from a follower lease is gated; leader-forwarded reads
@@ -3713,34 +3721,56 @@ where
                 // Reuse the poll batch's cached clock read rather than sampling the clock every time.
                 let now = *ctx.current_time.get_or_insert_with(monotonic_raw_now);
                 let waited = (now - read.propose_time).to_std().unwrap_or_default();
-                match gate.poll_read_gate(marker, self.region_id, waited >= crate::store::READ_GATE_GIVE_UP) {
-                    crate::store::ReadGatePoll::Resolved(switch_index) => {
+                let give_up = match gate.poll_read_gate(
+                    marker,
+                    self.region_id,
+                    waited >= crate::store::READ_GATE_GIVE_UP,
+                ) {
+                    crate::store::ReadGatePoll::Resolved(stamp) => {
                         // Record how long this read waited on the switch gate.
                         SIDECHANNEL_READ_GATE_WAIT_DURATION.observe(duration_to_sec(waited));
-                        read.read_gate_resolved = Some(switch_index);
+                        // SAFE-1: the stamp covers this term's credits only if it was taken
+                        // in the term raft served the read in. A stamp from another term
+                        // (e.g. a deposed leader's write landed first after a switch reboot)
+                        // gives no floor.
+                        match stamp.floor_in_term(read.read_state_term) {
+                            Some(switch_index) => {
+                                read.read_gate_resolved = Some(switch_index);
+                                None
+                            }
+                            None => Some((
+                                "switch read gate stamp is from another term",
+                                stamp.term as u64,
+                            )),
+                        }
                     }
                     crate::store::ReadGatePoll::Pending => {
                         self.pending_reads.push_front(read);
                         break;
                     }
-                    crate::store::ReadGatePoll::GiveUp => {
-                        // Persistent sidechannel loss (e.g. the switch is down):
-                        // fail the read cleanly instead of gating it forever. The
-                        // client retries, same as the applied-index-lag path below.
-                        warn!(
-                            "switch read gate timed out, failing replica read";
-                            "region_id" => self.region_id,
-                            "peer_id" => self.peer_id(),
-                            "marker" => marker,
-                        );
-                        let mut response = cmd_resp::new_error(Error::ReadIndexNotReady {
-                            region_id: self.region_id,
-                            reason: "switch read gate timed out",
-                        });
-                        cmd_resp::bind_term(&mut response, self.term());
-                        self.respond_replica_read_error(&mut read, response);
-                        continue;
-                    }
+                    // Persistent sidechannel loss (e.g. the switch is down).
+                    crate::store::ReadGatePoll::GiveUp => Some(("switch read gate timed out", 0)),
+                };
+                if let Some((reason, stamp_term)) = give_up {
+                    // Fail the read cleanly instead of gating it forever or serving it
+                    // without a floor. The client retries, same as the applied-index-lag
+                    // path below.
+                    warn!(
+                        "switch read gate gave up, failing replica read";
+                        "reason" => reason,
+                        "region_id" => self.region_id,
+                        "peer_id" => self.peer_id(),
+                        "marker" => marker,
+                        "stamp_term" => stamp_term,
+                        "read_state_term" => read.read_state_term,
+                    );
+                    let mut response = cmd_resp::new_error(Error::ReadIndexNotReady {
+                        region_id: self.region_id,
+                        reason,
+                    });
+                    cmd_resp::bind_term(&mut response, self.term());
+                    self.respond_replica_read_error(&mut read, response);
+                    continue;
                 }
             }
 
@@ -3813,8 +3843,10 @@ where
                 read_index_ctx.id,
                 read_index_ctx.locked,
                 state.index,
-                // Carried only for a follower's assist gate
+                // Carried only for a follower's assist gate: provenance, and the term
+                // its switch stamp must have been taken in (SAFE-1).
                 state.served_by_follower_lease,
+                state.term,
             )
         });
         // The follower may lost `ReadIndexResp`, so the pending_reads does not
