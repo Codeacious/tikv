@@ -25,12 +25,12 @@
 //! `tikv` crate. All state is keyed by region id.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU32, AtomicU64, Ordering},
         Arc, Mutex, OnceLock, RwLock,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossbeam::channel::{unbounded, Receiver, Sender};
@@ -43,6 +43,74 @@ pub const READ_GATE_GIVE_UP: Duration = Duration::from_secs(1);
 /// region is refreshed every *other* tick, because the refresh's own reflection
 /// sets the liveness flag for the tick after it.
 pub const SWITCH_REGISTER_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How long a switch answer that no read has claimed yet is kept: one to two
+/// periods while answers keep arriving, longer when they stop (see
+/// `ResolvedStamps`). A read normally claims
+/// its answer within milliseconds; an unclaimed one is an orphan (its read was
+/// answered elsewhere, gave up, or went to a store that leads the region), and
+/// this bounds how many accumulate. Matches etcd's `resolvedMarkerTTL`.
+const RESOLVED_TTL: Duration = Duration::from_secs(1);
+
+/// A read-gate marker scoped to the region its read concerns. A stamp is one
+/// region's register, so it only ever answers a read in that region (SAFE-6):
+/// region ids name raft groups, and the stamp's index is in that group's log.
+type MarkerKey = (u64, u64);
+
+/// Switch answers waiting to be claimed by their read's next serve-gate poll,
+/// by (marker, region). Two generations: an insert at least `RESOLVED_TTL`
+/// after the last rotation makes the current one the previous one and drops
+/// the old previous one. Rotation is driven by inserts only, so an unclaimed
+/// answer is gone one to two periods after it arrived only while answers keep
+/// arriving; with none, it stays. That is only memory, and an idle map does
+/// not grow. Safety never relies on it: keys do not recur (random client
+/// namespaces, `is_client_marker` at both entry points, batch release only
+/// for keys still in `pending`).
+struct ResolvedStamps {
+    curr: HashMap<MarkerKey, SwitchStamp>,
+    prev: HashMap<MarkerKey, SwitchStamp>,
+    last_rotate: Instant,
+}
+
+impl ResolvedStamps {
+    fn new(now: Instant) -> Self {
+        ResolvedStamps {
+            curr: HashMap::new(),
+            prev: HashMap::new(),
+            last_rotate: now,
+        }
+    }
+
+    fn insert_at(&mut self, key: MarkerKey, stamp: SwitchStamp, now: Instant) {
+        if now.saturating_duration_since(self.last_rotate) >= RESOLVED_TTL {
+            self.prev = std::mem::take(&mut self.curr);
+            self.last_rotate = now;
+        }
+        self.curr.insert(key, stamp);
+    }
+
+    fn insert(&mut self, key: MarkerKey, stamp: SwitchStamp) {
+        self.insert_at(key, stamp, Instant::now());
+    }
+
+    fn remove(&mut self, key: &MarkerKey) -> Option<SwitchStamp> {
+        self.curr.remove(key).or_else(|| self.prev.remove(key))
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.curr.len() + self.prev.len()
+    }
+}
+
+/// Whether `marker` lies in the client namespace: a nonzero upper 32 bits. The
+/// zero-upper-32 namespace belongs to this store's server-minted read markers
+/// (`mint_server_marker`), which restart at 1 on every start; a client marker
+/// there could resolve one with a stamp taken before that read began (SAFE-7).
+/// Both client-marker entry points accept only this namespace.
+pub fn is_client_marker(marker: u64) -> bool {
+    marker >> 32 != 0
+}
 
 /// Reserved "no saved index" value, matching `tack-switch-tikv-multiregion.p4`,
 /// which serves 0 for a slot holding another region (or none). It is also what
@@ -137,20 +205,34 @@ pub struct SwitchReadGate {
     /// `RwLock` guards only the map container; each region has its own small
     /// lock, so different regions never serialize on the hot path.
     latest: RwLock<HashMap<u64, Arc<Mutex<SwitchStamp>>>>,
-    /// Counter for server-minted markers and batch ids. Server markers are
-    /// masked into the low 32 bits so they cannot collide with client-minted
-    /// markers, which have nonzero upper 32 bits.
+    /// Counter for server-minted markers. They are masked into the low 32
+    /// bits so they cannot collide with client-minted markers, which have
+    /// nonzero upper 32 bits.
     marker_seq: AtomicU64,
-    /// Markers registered by the serve gate and awaiting confirmation, mapped
-    /// to the region each read concerns.
-    pending: Mutex<HashMap<u64, u64>>,
-    /// Confirmed marker -> switch stamp, consumed by the next serve-gate poll.
-    resolved: Mutex<HashMap<u64, SwitchStamp>>,
+    /// Random, nonzero upper half of every batch id this instance mints; see
+    /// `next_marker`.
+    batch_incarnation: u32,
+    /// Lower half of the last batch id minted.
+    batch_seq: AtomicU32,
+    /// (marker, region) pairs registered by the serve gate and awaiting
+    /// confirmation.
+    pending: Mutex<HashSet<MarkerKey>>,
+    /// Confirmed (marker, region) -> switch stamp, consumed by the next
+    /// serve-gate poll; unclaimed entries expire.
+    resolved: Mutex<ResolvedStamps>,
     /// Batches with an in-flight `QuerySwitchIndex`, each for a single region.
     pending_batches: Mutex<Vec<PendingMarkerBatch>>,
     /// Newly-pending `(marker, region_id)` pairs handed to the sidechannel's
     /// batched query loop.
     pending_markers_tx: Sender<(u64, u64)>,
+}
+
+/// A random, nonzero batch-id upper half.
+fn new_batch_incarnation() -> u32 {
+    match rand::random::<u32>() {
+        0 => 1,
+        inc => inc,
+    }
 }
 
 impl SwitchReadGate {
@@ -162,8 +244,10 @@ impl SwitchReadGate {
             latest: RwLock::new(HashMap::new()),
             // Start at 1 so 0 stays a reserved "no marker" sentinel.
             marker_seq: AtomicU64::new(1),
-            pending: Mutex::new(HashMap::new()),
-            resolved: Mutex::new(HashMap::new()),
+            batch_incarnation: new_batch_incarnation(),
+            batch_seq: AtomicU32::new(0),
+            pending: Mutex::new(HashSet::new()),
+            resolved: Mutex::new(ResolvedStamps::new(Instant::now())),
             pending_batches: Mutex::new(Vec::new()),
             pending_markers_tx: tx,
         });
@@ -218,9 +302,15 @@ impl SwitchReadGate {
     }
 
     /// Mints a server-side marker for a marker-less read, in the low 32-bit
-    /// namespace so it never collides with a client-minted marker.
+    /// namespace so it never collides with a client-minted marker. Wraps
+    /// within the low 32 bits, skipping 0 (the "no marker" sentinel).
     pub fn mint_server_marker(&self) -> u64 {
-        self.marker_seq.fetch_add(1, Ordering::Relaxed) & 0x0000_0000_FFFF_FFFF
+        loop {
+            let m = self.marker_seq.fetch_add(1, Ordering::Relaxed) & 0x0000_0000_FFFF_FFFF;
+            if m != 0 {
+                return m;
+            }
+        }
     }
 
     /// Non-blocking serve-gate poll. Returns `Resolved(stamp)` once the switch
@@ -237,28 +327,23 @@ impl SwitchReadGate {
         // An unusable stamp carries no index floor, so it is not a resolution.
         // Both writers already refuse to record one; restated here at the single
         // consumption point.
-        if let Some(stamp) = resolved.remove(&marker)
+        let key = (marker, region_id);
+        if let Some(stamp) = resolved.remove(&key)
             && stamp.is_usable()
         {
             drop(resolved);
-            self.pending.lock().unwrap().remove(&marker);
+            self.pending.lock().unwrap().remove(&key);
             return ReadGatePoll::Resolved(stamp);
         }
         if expired {
             // Drop from `pending` so `retain_pending` stops re-querying and a
             // batch release can't re-resolve it. A late client `MsgReadIndex` can
-            // still leave an orphaned `resolved` entry — bounded, never
-            // re-consumed, left as-is.
+            // still leave an orphaned `resolved` entry; it expires.
             drop(resolved);
-            self.pending.lock().unwrap().remove(&marker);
+            self.pending.lock().unwrap().remove(&key);
             return ReadGatePoll::GiveUp;
         }
-        let newly = self
-            .pending
-            .lock()
-            .unwrap()
-            .insert(marker, region_id)
-            .is_none();
+        let newly = self.pending.lock().unwrap().insert(key);
         drop(resolved);
         if newly {
             // Unbounded, so this never blocks; the query loop is the batching
@@ -292,14 +377,43 @@ impl SwitchReadGate {
         if marker == 0 {
             return;
         }
+        // Keyed by the stamp's region: a read in another region never claims
+        // it (SAFE-6), and waits for its own region's answer instead.
+        let key = (marker, region_id);
         let mut resolved = self.resolved.lock().unwrap();
-        self.pending.lock().unwrap().remove(&marker);
-        resolved.insert(marker, stamp);
+        self.pending.lock().unwrap().remove(&key);
+        resolved.insert(key, stamp);
     }
 
-    /// Mints the next marker from the shared sequence (used for batch ids).
+    /// Mints the next batch id: `batch_incarnation` in the upper 32 bits, the
+    /// batch sequence in the lower 32.
+    ///
+    /// SAFE-3: a sequence restarting at 1 on every start let a query reply
+    /// delayed across a restart release this instance's batches (release is
+    /// cumulative) with a register value read before their reads began. A
+    /// random incarnation per instance makes such replies identifiable
+    /// (`is_own_batch_marker`), and the reply path drops them. Mirrors the
+    /// incarnation in raft-rs lease ids.
+    ///
+    /// Batch ids never enter `pending`, and travel only in this store's own
+    /// queries and their replies (to == from == self), so they cannot meet a
+    /// client marker despite the nonzero upper half. Server-minted read
+    /// markers stay in the low 32-bit namespace (`mint_server_marker`).
+    ///
+    /// The sequence wraps within the lower 32 bits, keeping the incarnation;
+    /// `release_pending_batches` compares it wrap-safely.
     pub fn next_marker(&self) -> u64 {
-        self.marker_seq.fetch_add(1, Ordering::Relaxed)
+        let seq = self
+            .batch_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        u64::from(self.batch_incarnation) << 32 | u64::from(seq)
+    }
+
+    /// Whether `marker` is a batch id this instance minted, as opposed to one
+    /// from a previous instance of this store (SAFE-3).
+    pub fn is_own_batch_marker(&self, marker: u64) -> bool {
+        (marker >> 32) as u32 == self.batch_incarnation
     }
 
     /// Records a batch of markers for `region_id` under an in-flight query's
@@ -315,13 +429,13 @@ impl SwitchReadGate {
             });
     }
 
-    /// Filters `markers` down to those still awaiting resolution.
-    pub fn retain_pending(&self, markers: &[u64]) -> Vec<u64> {
+    /// Filters `(marker, region)` pairs down to those still awaiting
+    /// resolution.
+    pub fn retain_pending(&self, keys: &[(u64, u64)]) -> Vec<(u64, u64)> {
         let pending = self.pending.lock().unwrap();
-        markers
-            .iter()
+        keys.iter()
             .copied()
-            .filter(|m| pending.contains_key(m))
+            .filter(|k| pending.contains(k))
             .collect()
     }
 
@@ -336,6 +450,11 @@ impl SwitchReadGate {
     ///
     /// The floor is `answered`, not the cached `latest_switch_stamp`: a higher
     /// cache only means another read sampled the same register later.
+    ///
+    /// The caller has checked `is_own_batch_marker(batch_marker)` (SAFE-3), so
+    /// only the lower halves are compared, as RFC 1982 serial numbers: the
+    /// batches in flight span far less than 2^31 ids, so "at or below" stays
+    /// correct across the sequence's wrap.
     pub fn release_pending_batches(
         &self,
         batch_marker: u64,
@@ -350,7 +469,8 @@ impl SwitchReadGate {
             let mut released = Vec::new();
             let mut kept = Vec::new();
             for b in batches.drain(..) {
-                if b.region_id == region_id && b.local_marker <= batch_marker {
+                let newer = (b.local_marker as u32).wrapping_sub(batch_marker as u32) as i32 > 0;
+                if b.region_id == region_id && !newer {
                     released.push(b);
                 } else {
                     kept.push(b);
@@ -366,8 +486,9 @@ impl SwitchReadGate {
         let mut pending = self.pending.lock().unwrap();
         for batch in released {
             for marker in batch.markers {
-                if pending.remove(&marker).is_some() {
-                    resolved.insert(marker, answered);
+                let key = (marker, batch.region_id);
+                if pending.remove(&key) {
+                    resolved.insert(key, answered);
                 }
             }
         }
@@ -406,6 +527,13 @@ pub trait SwitchRegisterRefresher: Send + Sync + 'static {
     /// talking, or for which nothing was ever tapped for this region, is
     /// skipped.
     fn refresh_region(&self, region_id: u64);
+
+    /// Records the stores holding a live read lease for `region_id` from this
+    /// leader ("credit-all"): a switch reply for the region is credited to
+    /// every one of them behind the same switch, since that switch's one slot
+    /// stamps all their reads. An empty list clears it; raftstore passes one
+    /// when this peer is no longer a lease-holding leader.
+    fn set_lease_holders(&self, region_id: u64, holder_stores: Vec<u64>);
 }
 
 static GLOBAL_SWITCH_REGISTER_REFRESHER: OnceLock<Arc<dyn SwitchRegisterRefresher>> =
@@ -664,5 +792,125 @@ mod tests {
             }
             _ => panic!("batch did not release the read"),
         }
+    }
+
+    /// SAFE-3: every instance draws its own nonzero incarnation, every batch
+    /// id it mints carries it, and another instance's ids are not its own.
+    #[test]
+    fn test_batch_markers_carry_incarnation() {
+        let (a, _ra) = SwitchReadGate::new();
+        let (b, _rb) = SwitchReadGate::new();
+        assert_ne!(a.batch_incarnation, 0);
+        assert_ne!(b.batch_incarnation, 0);
+        // 2^-32 flake odds.
+        assert_ne!(a.batch_incarnation, b.batch_incarnation);
+        for _ in 0..3 {
+            let m = a.next_marker();
+            assert!(a.is_own_batch_marker(m));
+            assert!(!b.is_own_batch_marker(m));
+        }
+        // A pre-fix batch id (upper half 0) is nobody's.
+        assert!(!a.is_own_batch_marker(5000));
+    }
+
+    /// SAFE-3: release is cumulative, so it must order batch ids correctly
+    /// across the lower half's wrap. A reply to the last id before the wrap
+    /// releases nothing minted after it; one after the wrap releases all.
+    #[test]
+    fn test_batch_release_across_seq_wrap() {
+        let (gate, _rx) = SwitchReadGate::new();
+        let id = |seq: u32| u64::from(gate.batch_incarnation) << 32 | u64::from(seq);
+        let reads: Vec<u64> = (0..4).map(|_| gate.mint_server_marker()).collect();
+        for (&read, seq) in reads.iter().zip([u32::MAX - 1, u32::MAX, 0, 1]) {
+            assert_pending(poll(&gate, read, false));
+            gate.record_pending_batch(id(seq), REGION, vec![read]);
+        }
+
+        gate.release_pending_batches(id(u32::MAX), REGION, st(900));
+        assert_resolved(poll(&gate, reads[0], false), st(900));
+        assert_resolved(poll(&gate, reads[1], false), st(900));
+        assert_pending(poll(&gate, reads[2], false));
+        assert_pending(poll(&gate, reads[3], false));
+
+        gate.release_pending_batches(id(1), REGION, st(1200));
+        assert_resolved(poll(&gate, reads[2], false), st(1200));
+        assert_resolved(poll(&gate, reads[3], false), st(1200));
+        assert!(gate.pending_batches.lock().unwrap().is_empty());
+    }
+
+    /// SAFE-6: a stamp is one region's register, so it never answers a read in
+    /// another region, whether it lands before the read polls or while it
+    /// waits. The read is answered by its own region's stamp.
+    #[test]
+    fn test_stamp_for_another_region_does_not_resolve() {
+        const OTHER: u64 = REGION + 1;
+        let (gate, _rx) = SwitchReadGate::new();
+        let during = 0xABCD_0000_0000_0001;
+        let before = 0xABCD_0000_0000_0002;
+
+        assert_pending(poll(&gate, during, false));
+        gate.update_switch_index(during, OTHER, st(500));
+        assert_pending(poll(&gate, during, false));
+
+        gate.update_switch_index(before, OTHER, st(500));
+        assert_pending(poll(&gate, before, false));
+
+        // A batch answer for the other region releases neither.
+        let batch = gate.next_marker();
+        gate.record_pending_batch(batch, OTHER, vec![during, before]);
+        gate.release_pending_batches(batch, OTHER, st(600));
+        assert_pending(poll(&gate, during, false));
+        assert_pending(poll(&gate, before, false));
+
+        gate.update_switch_index(during, REGION, st(42));
+        assert_resolved(poll(&gate, during, false), st(42));
+    }
+
+    /// SAFE-6: one marker waiting in two regions is two pending reads. Each
+    /// is queued for its own region's query, and each region's answer
+    /// releases only its own.
+    #[test]
+    fn test_same_marker_in_two_regions_is_tracked_per_region() {
+        const OTHER: u64 = REGION + 1;
+        let (gate, rx) = SwitchReadGate::new();
+        let marker = 0xABCD_0000_0000_0003;
+
+        assert_pending(gate.poll_read_gate(marker, REGION, false));
+        assert_pending(gate.poll_read_gate(marker, OTHER, false));
+        let queued: Vec<(u64, u64)> = rx.try_iter().collect();
+        assert_eq!(queued, vec![(marker, REGION), (marker, OTHER)]);
+        assert_eq!(gate.retain_pending(&queued), queued);
+
+        gate.update_switch_index(marker, OTHER, st(900));
+        assert_resolved(gate.poll_read_gate(marker, OTHER, false), st(900));
+        assert_pending(gate.poll_read_gate(marker, REGION, false));
+        assert_eq!(gate.retain_pending(&queued), vec![(marker, REGION)]);
+    }
+
+    /// Under steady inserts, unclaimed answers expire one to two `RESOLVED_TTL`
+    /// periods after they arrive; a claimed one is gone at once.
+    #[test]
+    fn test_unclaimed_answers_expire() {
+        let t0 = Instant::now();
+        let mut r = ResolvedStamps::new(t0);
+        let (a, b, c) = ((1, REGION), (2, REGION), (3, REGION));
+        r.insert_at(a, st(1), t0);
+        r.insert_at(b, st(2), t0 + RESOLVED_TTL); // rotates: a is now previous
+        assert_eq!(r.len(), 2);
+        r.insert_at(c, st(3), t0 + 2 * RESOLVED_TTL); // rotates: a dropped
+        assert_eq!(r.remove(&a), None);
+        assert_eq!(r.remove(&b), Some(st(2)));
+        assert_eq!(r.remove(&b), None);
+        assert_eq!(r.remove(&c), Some(st(3)));
+    }
+
+    /// Server markers wrap within the low 32 bits and skip 0.
+    #[test]
+    fn test_server_markers_wrap_and_skip_zero() {
+        let (gate, _rx) = SwitchReadGate::new();
+        gate.marker_seq.store(0xFFFF_FFFF, Ordering::Relaxed);
+        assert_eq!(gate.mint_server_marker(), 0xFFFF_FFFF);
+        assert_eq!(gate.mint_server_marker(), 1);
+        assert_eq!(gate.mint_server_marker(), 2);
     }
 }

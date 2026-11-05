@@ -78,8 +78,8 @@ pub use self::{
     },
     snapshot_backup::SnapshotBrWaitApplySyncer,
     switch_read_gate::{
-        global_switch_read_gate, global_switch_register_refresher, set_global_switch_read_gate,
-        set_global_switch_register_refresher, ReadGatePoll, SwitchReadGate,
+        global_switch_read_gate, global_switch_register_refresher, is_client_marker,
+        set_global_switch_read_gate, set_global_switch_register_refresher, ReadGatePoll, SwitchReadGate,
         SwitchRegisterRefresher, SwitchStamp, READ_GATE_GIVE_UP,
         SWITCH_REGISTER_REFRESH_INTERVAL,
     },

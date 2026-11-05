@@ -2536,6 +2536,9 @@ where
         // Placed after the mailbox lookup so a peer being destroyed (no
         // mailbox, so no arming) cannot re-fire this on every `handle_msgs`.
         // TODO: Is cancelling this timer when the UDP sidechannel outbound path sends an update reasonable?
+        // Credit-all: tell the sidechannel which stores hold a lease for this
+        // region, so a switch reply credits all of them behind that switch.
+        refresher.set_lease_holders(region_id, self.switch_lease_holder_stores());
         refresher.refresh_region(region_id);
         let peer_id = self.fsm.peer.peer_id();
         let delay = self
@@ -2557,7 +2560,42 @@ where
     }
 
     fn switch_register_refresh_tick(&mut self) {
+        // The tick was armed while this peer was a lease-holding leader. If it
+        // no longer is, stop crediting its former holders (credit-all); this
+        // runs once per armed tick, not on every message batch.
+        if let Some(refresher) = crate::store::global_switch_register_refresher()
+            && self
+                .fsm
+                .peer
+                .raft_group
+                .micros_until_next_lease_expiry_timeout()
+                .is_none()
+        {
+            refresher.set_lease_holders(self.region_id(), Vec::new());
+        }
         self.schedule_switch_register_refresh_tick();
+    }
+
+    /// The stores of this region's peers that hold a live read lease from this
+    /// leader, by the leader's clock (raft-rs `has_active_granted_lease`, which
+    /// also reaps expired grants, as raft-rs does itself). Assist only.
+    fn switch_lease_holder_stores(&mut self) -> Vec<u64> {
+        let self_id = self.fsm.peer.peer_id();
+        let peers: Vec<(u64, u64)> = self
+            .fsm
+            .peer
+            .region()
+            .get_peers()
+            .iter()
+            .filter(|p| p.get_id() != self_id)
+            .map(|p| (p.get_id(), p.get_store_id()))
+            .collect();
+        let read_only = &mut self.fsm.peer.raft_group.raft.read_only;
+        peers
+            .into_iter()
+            .filter(|(peer_id, _)| read_only.has_active_granted_lease(*peer_id))
+            .map(|(_, store_id)| store_id)
+            .collect()
     }
 
     fn register_raft_base_tick(&mut self) {
