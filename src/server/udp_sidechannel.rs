@@ -127,8 +127,9 @@ pub const RAFT_SIDECHANNEL_MAGIC_KEY: &str = "raft-sidechannel-magic";
 /// carrier, NOT that field's real meaning (TiKV reads it only in the txn
 /// prewrite path, `storage/txn/commands/prewrite.rs`, never on any read path).
 /// Keep in sync with client-go's `rawkv.SetReadGateMarker`. `0` = no client
-/// marker; the serve gate then mints a server-side one. A value outside the
-/// client namespace (zero upper 32 bits) is treated as none (SAFE-7).
+/// marker; the read then waits on a server-minted one
+/// (`raftkv::switch_stamp_wait`). A value outside the client namespace (zero
+/// upper 32 bits) is treated as none (SAFE-7).
 pub fn read_gate_marker_from_ctx(ctx: &kvproto::kvrpcpb::Context) -> u64 {
     let marker = ctx.get_txn_source();
     if is_client_marker(marker) { marker } else { 0 }
@@ -283,11 +284,14 @@ impl RegionTapState {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct RegionWriteState {
     /// The highest end index of any `MsgAppend` this store has copied for the
-    /// region: its own proposals only, never a credited reply value (a
-    /// deposed leader's stale-high register must not outlive a reboot). Every
-    /// write carries it, and every credit is capped at it (read before the
-    /// boot check), so whichever write reaches a freshly booted switch first
-    /// covers every credit this store has given for the region.
+    /// region in `leader_term`: its own proposals only, never a credited reply
+    /// value (a deposed leader's stale-high register must not outlive a
+    /// reboot). Every write carries it, and every credit is capped at it (read
+    /// before the boot check), so whichever write reaches a freshly booted
+    /// switch first covers every credit this store has given for the region in
+    /// the term. It starts over when `leader_term` rises: the switch keeps one
+    /// (term, index) pair per slot, and an earlier term's mark would hold this
+    /// term's reads back until commit passed it (LIVE-3 Part B).
     high_water: u64,
     /// The highest term of any `MsgAppend` copied for the region, i.e. a term
     /// in which this store led it. Refreshes and re-seeds, which no raft
@@ -476,8 +480,9 @@ impl UdpSidechannel {
         }
         *sc.loop_handles.lock().unwrap() = handles;
 
-        // Publish the shared gate so raftstore's read path (propose hint + serve
-        // gate) can reach it, and the refresher so its leader-side tick can.
+        // Publish the shared gate so the read path (the stamp wait in `raftkv`,
+        // the hint in raftstore) can reach it, and the refresher so its
+        // leader-side tick can.
         raftstore::store::set_global_switch_read_gate(sc.gate.clone());
         raftstore::store::set_global_switch_register_refresher(sc.clone());
 
@@ -545,12 +550,6 @@ impl UdpSidechannel {
         u16::from_str_radix(s, 16).ok()
     }
 
-    /// Latest switch stamp cached for `region_id`. Currently unused: the
-    /// propose-time hint reads the gate directly from `Peer`.
-    pub fn latest_switch_stamp(&self, region_id: u64) -> SwitchStamp {
-        self.gate.latest_switch_stamp(region_id)
-    }
-
     /// Cadence hook kept for symmetry with `RaftClient::flush` /
     /// `ServerTransport::flush`. The dedicated send loop drains the out channel
     /// continuously, so there is nothing to flush; this is a no-op.
@@ -603,7 +602,9 @@ impl UdpSidechannel {
                 let boot_id = path.boot.load(Ordering::SeqCst);
                 #[cfg(test)]
                 self.run_test_hook("tap");
-                let high_water = self.raise_on_copy(region_id, end, term);
+                let Some(high_water) = self.raise_on_copy(region_id, end, term) else {
+                    return;
+                };
                 {
                     let mut regions = regions.lock().unwrap();
                     if !regions
@@ -648,15 +649,23 @@ impl UdpSidechannel {
         self.enqueue(out);
     }
 
-    /// Raises `region_id`'s high-water mark to at least `end` and its leader
-    /// term to at least `term`, for a `MsgAppend` copied at `term`; returns the
-    /// resulting high-water mark.
-    fn raise_on_copy(&self, region_id: u64, end: u64, term: u64) -> u64 {
+    /// Records a `MsgAppend` for `region_id` copied at `term` and ending at
+    /// `end`; returns the high-water mark to write. A copy from a newer term
+    /// starts the mark over at `end`; one from an older term (a copy delayed
+    /// past this store's next term as leader) is not written at all (`None`)
+    /// and leaves the mark alone.
+    fn raise_on_copy(&self, region_id: u64, end: u64, term: u64) -> Option<u64> {
         let mut writes = self.region_writes.lock().unwrap();
         let w = writes.entry(region_id).or_default();
-        w.high_water = w.high_water.max(end);
-        w.leader_term = w.leader_term.max(term);
-        w.high_water
+        match term.cmp(&w.leader_term) {
+            std::cmp::Ordering::Less => return None,
+            std::cmp::Ordering::Greater => {
+                w.high_water = end;
+                w.leader_term = term;
+            }
+            std::cmp::Ordering::Equal => w.high_water = w.high_water.max(end),
+        }
+        Some(w.high_water)
     }
 
     /// Records the stores holding a live read lease for `region_id` from this
@@ -925,11 +934,11 @@ impl UdpSidechannel {
                 // Either the switch has nothing saved for this region in this
                 // boot (or its slot holds another region), or no switch touched
                 // the packet; indistinguishable and handled identically —
-                // `update_switch_index` drops it rather than resolving the
+                // `resolve_marker` drops it rather than resolving the
                 // marker on it.
                 self.warn_zero_switch_index("MsgReadIndex", d.region_id);
             }
-            self.gate.update_switch_index(d.marker, d.region_id, stamp);
+            self.gate.resolve_marker(d.marker, d.region_id, stamp);
             return;
         }
 
@@ -953,19 +962,17 @@ impl UdpSidechannel {
             if d.msg_type == wire_type(MessageType::MsgAskAckIndexResp) {
                 // SAFE-3: an answer to a query a previous instance of this
                 // store sent. Its value may predate every read now waiting,
-                // so it must release none of them, nor seed the cache that
-                // read_index_hint proposes from.
+                // so it must release none of them.
                 if !self.gate.is_own_batch_marker(d.marker) {
                     debug!("dropped UDP sidechannel query reply from another incarnation"; "marker" => d.marker, "region_id" => d.region_id);
                     return;
                 }
-                // The marker may identify a batched local query; both the
-                // cache update and the batch release are scoped to `region_id`.
+                // The marker may identify a batched local query; the batch
+                // release is scoped to `region_id`.
                 let stamp = SwitchStamp::new(d.value, d.term);
                 if !stamp.is_usable() {
                     self.warn_zero_switch_index("MsgAskAckIndexResp", d.region_id);
                 }
-                self.gate.update_switch_index(0, d.region_id, stamp);
                 self.gate
                     .release_pending_batches(d.marker, d.region_id, stamp);
             }
@@ -1036,8 +1043,6 @@ impl UdpSidechannel {
             return;
         }
 
-        self.gate
-            .update_switch_index(0, d.region_id, SwitchStamp::new(d.value, d.term));
         if d.value == 0 {
             // Nothing written for this region in this boot (or its slot holds
             // another region): no information, and no credit.
@@ -1058,7 +1063,7 @@ impl UdpSidechannel {
             return;
         }
         if let Some(route) = route {
-            self.feed_reflected_ack(&route, credit);
+            self.feed_reflected_ack(&route, credit, d.term);
         }
 
         // Credit-all: credit every other lease holder of this region behind
@@ -1094,7 +1099,7 @@ impl UdpSidechannel {
                 .collect()
         };
         for route in extra {
-            self.feed_reflected_ack(&route, credit);
+            self.feed_reflected_ack(&route, credit, d.term);
         }
     }
 
@@ -1184,12 +1189,16 @@ impl UdpSidechannel {
     /// feeds it into the local raft group as if the follower sent it (from/to
     /// swapped relative to the outgoing tap). Term 0: raft-rs credits it
     /// without an incarnation check.
-    fn feed_reflected_ack(&self, route: &RaftRoute, value: u64) {
+    fn feed_reflected_ack(&self, route: &RaftRoute, value: u64, term: u32) {
         let mut inner = raft::eraftpb::Message::default();
         inner.set_msg_type(MessageType::MsgAskAckIndexResp);
         inner.set_to(route.self_peer.get_id());
         inner.set_from(route.remote_peer.get_id());
         inner.set_index(value);
+        // The term the switch reported with the credit; raft-rs credits it only
+        // in that term, since the switch's index rises only within a term
+        // (LIVE-3 Part B).
+        inner.set_log_term(u64::from(term));
 
         let mut rm = RaftMessage::default();
         rm.set_region_id(route.region_id);
@@ -1478,8 +1487,9 @@ mod tests {
     use std::sync::Weak;
 
     use crossbeam::channel::unbounded;
+    use futures::executor::block_on;
     use raft::eraftpb::{Entry, Message};
-    use raftstore::store::ReadGatePoll;
+    use raftstore::store::StampWait;
 
     use super::*;
 
@@ -1768,10 +1778,12 @@ mod tests {
                     let v = m.value as u32;
                     let s = self.slots.entry(idx).or_default();
                     if hit.is_some() {
-                        if wrap_gt(v, s.value) {
+                        // One (term, index) pair, compared term first.
+                        if m.term > s.term {
+                            (s.value, s.term) = (v, m.term);
+                        } else if m.term == s.term && wrap_gt(v, s.value) {
                             s.value = v;
                         }
-                        s.term = s.term.max(m.term);
                     } else {
                         *s = Slot {
                             value: v,
@@ -1996,8 +2008,8 @@ mod tests {
 
     /// A reply that does not carry the switch's current boot ID (a pre-reboot
     /// reply delivered late) is dropped. It credits nothing, does not mark the
-    /// path healthy or reach the gate cache, and does not adopt its boot ID,
-    /// which would roll the switch back to a dead boot.
+    /// path healthy, and does not adopt its boot ID, which would roll the
+    /// switch back to a dead boot.
     #[test]
     fn test_reply_from_other_boot_not_credited() {
         let h = Harness::new();
@@ -2011,7 +2023,6 @@ mod tests {
         assert_eq!(h.high_water(REGION), 100);
         assert!(!h.switch_updated(2, REGION));
         assert_eq!(h.peer_boot(2), TEST_BOOT);
-        assert_eq!(h.sc.latest_switch_stamp(REGION), SwitchStamp::default());
         assert!(
             h.drain().is_empty(),
             "a reply from another boot triggered writes"
@@ -2033,8 +2044,6 @@ mod tests {
         assert_eq!(h.credits(), vec![(2, 100, 100)]);
         assert_eq!(h.high_water(REGION), 100, "a credit raised the mark");
         assert!(h.switch_updated(2, REGION));
-        // The gate cache records what the switch said, uncapped.
-        assert_eq!(h.sc.latest_switch_stamp(REGION), SwitchStamp::new(900, 5));
         // Below the mark, the reply's own value.
         h.handle(&reply(2, REGION, 60, TEST_BOOT, 5));
         assert_eq!(h.credits(), vec![(2, 60, 100)]);
@@ -2405,7 +2414,7 @@ mod tests {
             (5, 899, true),  // first write
             (5, 899, false), // nothing new
             (5, 499, false), // a catch-up MsgAppend below the high-water mark
-            (7, 499, true),  // same high-water mark, new term
+            (7, 499, true),  // new term (the mark starts over at 500)
             (6, 999, false), // an older term never writes, even with a higher index
             (7, 999, true),  // higher index in the current term
         ];
@@ -2443,6 +2452,120 @@ mod tests {
         );
     }
 
+    /// LIVE-3 Part B: the high-water mark belongs to the term it was copied
+    /// in. A copy from a newer term starts it over, even below the old mark, so
+    /// this term's writes no longer carry an earlier term's tail that may never
+    /// commit. A copy delayed from an older term is not written, on a path that
+    /// wrote the newer term or one that never wrote (where the per-path dedupe
+    /// would not catch it), and leaves the mark alone. Refreshes write the
+    /// current pair.
+    #[test]
+    fn test_high_water_starts_over_on_new_term() {
+        let h = Harness::new();
+        h.add_peer(2, TEST_BOOT);
+        h.add_peer(3, TEST_BOOT);
+        let writes = |h: &Harness| -> Vec<(u64, u64, u32)> {
+            h.drain().iter().map(|w| (w.to, w.value, w.term)).collect()
+        };
+
+        h.tap(REGION, 2, 5, 899, 1);
+        assert_eq!(writes(&h), vec![(2, 900, 5)]);
+        h.tap(REGION, 2, 7, 119, 1);
+        assert_eq!(writes(&h), vec![(2, 120, 7)]);
+
+        h.tap(REGION, 2, 5, 949, 1);
+        h.tap(REGION, 3, 5, 949, 1);
+        assert_eq!(writes(&h), vec![], "an older term's copy was written");
+        assert_eq!(
+            h.sc.region_write_state(REGION),
+            RegionWriteState {
+                high_water: 120,
+                leader_term: 7
+            }
+        );
+
+        h.sc.refresh_region(REGION);
+        assert_eq!(writes(&h), vec![(2, 120, 7)]);
+    }
+
+    /// LIVE-3 Part B: every credit tells raft the term the switch reported with
+    /// it (`log_term`), which raft-rs requires to be its own, since the
+    /// switch's index rises only within a term. That holds for the path's
+    /// follower and for every other lease holder behind the switch.
+    #[test]
+    fn test_credit_carries_reply_term() {
+        let h = Harness::new();
+        for store in [2, 3] {
+            h.add_peer(store, TEST_BOOT);
+            h.tap(REGION, store, 9, 99, 1);
+        }
+        h.drain();
+        h.sc.set_lease_holders(REGION, vec![2, 3]);
+
+        h.handle(&reply(2, REGION, 80, TEST_BOOT, 9));
+        let mut got: Vec<(u64, u64, u64, u64)> = h
+            .fed
+            .try_iter()
+            .map(|(rm, _)| {
+                let m = rm.get_message();
+                (
+                    rm.get_from_peer().get_store_id(),
+                    m.get_index(),
+                    m.get_term(),
+                    m.get_log_term(),
+                )
+            })
+            .collect();
+        got.sort_unstable();
+        assert_eq!(got, vec![(2, 80, 0, 9), (3, 80, 0, 9)]);
+    }
+
+    /// LIVE-3 Part B, through the switch contract: a new term's first write
+    /// replaces the slot, even with a lower index, rather than relabelling the
+    /// old index as the new term's, and it is credited in its own term. A
+    /// deposed leader's late write from the older term then changes nothing.
+    #[test]
+    fn test_new_term_write_replaces_older_index() {
+        let h = Harness::new();
+        h.add_peer(2, 0);
+        let mut sw = FakeSwitch::new();
+        h.tap(REGION, 2, 5, 899, 1); // NACKed, then re-seeded
+        h.pump(&mut sw);
+        h.credits();
+        assert_eq!(sw.stamp(REGION), SwitchStamp::new(900, 5));
+
+        h.tap(REGION, 2, 7, 119, 1);
+        h.pump(&mut sw);
+        assert_eq!(sw.stamp(REGION), SwitchStamp::new(120, 7));
+        let fed: Vec<(u64, u64)> = h
+            .fed
+            .try_iter()
+            .map(|(rm, _)| {
+                (
+                    rm.get_message().get_index(),
+                    rm.get_message().get_log_term(),
+                )
+            })
+            .collect();
+        assert_eq!(fed, vec![(120, 7)]);
+
+        // Another store's late write from term 5.
+        let late = WireMsg {
+            magic: MAGIC,
+            msg_type: T_APPEND,
+            to: 2,
+            from: 9,
+            value: 950,
+            region_id: REGION,
+            boot_id: sw.boot_id,
+            term: 5,
+            ..Default::default()
+        };
+        let r = sw.process(&encode(&late)).unwrap();
+        assert_eq!((r.msg_type, r.value, r.term), (T_REPLY, 120, 7));
+        assert_eq!(sw.stamp(REGION), SwitchStamp::new(120, 7));
+    }
+
     /// Each switch acts only on its own magic, so a reply on a peer's path
     /// carries that peer's magic, which need not be this store's.
     #[test]
@@ -2462,9 +2585,10 @@ mod tests {
     }
 
     /// A read's stamp reaches the gate with the term the switch put on it,
-    /// through both the client stamp and the batched query reply; a stamp with
-    /// no term (or no value) carries no information. Query replies feed only
-    /// the gate, without a boot check, and never credit raft.
+    /// through both the client stamp and the batched query reply, and becomes
+    /// the read's hint, term included. A stamp with no term (or no value)
+    /// carries no information. Query replies feed only the gate, without a
+    /// boot check, and never credit raft.
     #[test]
     fn test_stamp_carries_term_to_the_gate() {
         let h = Harness::new();
@@ -2481,60 +2605,42 @@ mod tests {
             boot_id: TEST_BOOT,
             term,
         };
-        let pending = |gate: &SwitchReadGate, marker: u64| {
-            matches!(
-                gate.poll_read_gate(marker, REGION, false),
-                ReadGatePoll::Pending
-            )
+        let waiting = |gate: &SwitchReadGate, marker: u64| {
+            !gate.retain_pending(&[(marker, REGION)]).is_empty()
         };
 
-        assert!(pending(&gate, marker));
+        let w = gate.wait_for_stamp(marker, REGION);
         h.handle(&stamp(400, 0)); // no term
-        assert!(pending(&gate, marker));
+        assert!(waiting(&gate, marker));
         h.handle(&stamp(0, 5)); // no value
-        assert!(pending(&gate, marker));
+        assert!(waiting(&gate, marker));
         h.handle(&stamp(500, 5));
-        match gate.poll_read_gate(marker, REGION, false) {
-            ReadGatePoll::Resolved(s) => {
-                assert_eq!(s, SwitchStamp::new(500, 5));
-                assert_eq!(s.floor_in_term(5), Some(500));
-                assert_eq!(s.floor_in_term(6), None);
-            }
-            _ => panic!("read not resolved by its stamp"),
-        }
+        let s = block_on(w.stamp()).expect("read not resolved by its stamp");
+        assert_eq!(s, SwitchStamp::new(500, 5));
+        assert_eq!(raftstore::store::switch_hint(Some(s)), (500, 5));
 
         // The batched path: a reply to this store's own query.
         let server = gate.mint_server_marker();
-        assert!(pending(&gate, server));
+        let w = gate.wait_for_stamp(server, REGION);
         let batch = gate.next_marker();
         gate.record_pending_batch(batch, REGION, vec![server]);
         let mut q = reply(LEADER, REGION, 510, TEST_BOOT + 2, 6);
         q.marker = batch;
         h.handle(&q);
-        match gate.poll_read_gate(server, REGION, false) {
-            ReadGatePoll::Resolved(s) => assert_eq!(s, SwitchStamp::new(510, 6)),
-            _ => panic!("batch not released by the query reply"),
-        }
-        assert_eq!(h.sc.latest_switch_stamp(REGION), SwitchStamp::new(510, 6));
+        assert_eq!(block_on(w.stamp()), Some(SwitchStamp::new(510, 6)));
         assert!(h.credits().is_empty());
-
-        // And the hint raftstore proposes with carries the cached term.
-        assert_eq!(gate.read_index_hint(REGION), (510, 6));
     }
 
     /// SAFE-3: a reply to a query a previous instance of this store sent
     /// (same store id, same listener) releases none of this instance's
-    /// batches and leaves the hint cache alone, whatever its sequence. The
-    /// reply to this instance's own query still releases them.
+    /// batches, whatever its sequence. The reply to this instance's own query
+    /// still releases them.
     #[test]
     fn test_stale_incarnation_query_reply_dropped() {
         let h = Harness::new();
         let gate = h.sc.gate.clone();
         let read = gate.mint_server_marker();
-        assert!(matches!(
-            gate.poll_read_gate(read, REGION, false),
-            ReadGatePoll::Pending
-        ));
+        let w = gate.wait_for_stamp(read, REGION);
         let batch = gate.next_marker();
         gate.record_pending_batch(batch, REGION, vec![read]);
 
@@ -2550,26 +2656,23 @@ mod tests {
             q.marker = stale;
             h.handle(&q);
         }
-        assert!(matches!(
-            gate.poll_read_gate(read, REGION, false),
-            ReadGatePoll::Pending
-        ));
-        assert_eq!(gate.read_index_hint(REGION), (u64::MAX, 0));
+        assert_eq!(gate.retain_pending(&[(read, REGION)]), vec![(read, REGION)]);
 
         let mut q = reply(LEADER, REGION, 1200, TEST_BOOT, 6);
         q.marker = batch;
         h.handle(&q);
-        match gate.poll_read_gate(read, REGION, false) {
-            ReadGatePoll::Resolved(s) => assert_eq!(s, SwitchStamp::new(1200, 6)),
-            _ => panic!("this instance's own reply did not release the batch"),
-        }
+        assert_eq!(
+            block_on(w.stamp()),
+            Some(SwitchStamp::new(1200, 6)),
+            "this instance's own reply did not release the batch"
+        );
         assert!(h.credits().is_empty());
     }
 
     /// SAFE-7: a reflected client `MsgReadIndex` whose marker has a zero upper
     /// half equals a marker this store mints for marker-less reads. Its stamp
-    /// predates that read, whether it lands before the read is registered or
-    /// while it waits, so it resolves nothing and leaves the hint cache alone.
+    /// predates that read, whether it lands before the read starts waiting or
+    /// while it waits, so it resolves nothing.
     #[test]
     fn test_server_namespace_reflection_cannot_resolve_minted_read() {
         let h = Harness::new();
@@ -2585,39 +2688,31 @@ mod tests {
             boot_id: TEST_BOOT,
             term: 5,
         };
-        let pending = |marker: u64| {
-            matches!(
-                gate.poll_read_gate(marker, REGION, false),
-                ReadGatePoll::Pending
-            )
-        };
+        let waiting = |marker: u64| !gate.retain_pending(&[(marker, REGION)]).is_empty();
 
         // While waiting.
         let during = gate.mint_server_marker();
-        assert!(pending(during));
+        let _w_during = gate.wait_for_stamp(during, REGION);
         h.handle(&stamp(during));
-        assert!(pending(during));
+        assert!(waiting(during));
 
         // Before the read: the next minted marker, reflected first.
         h.handle(&stamp(during + 1));
         let before = gate.mint_server_marker();
         assert_eq!(before, during + 1);
-        assert!(pending(before));
-
-        assert_eq!(gate.read_index_hint(REGION), (u64::MAX, 0));
+        let w_before = gate.wait_for_stamp(before, REGION);
+        assert!(matches!(w_before, StampWait::Pending(_)));
+        assert!(waiting(before));
 
         // A client-namespace marker still resolves.
         let client = 0xABCD_0000_0000_0007;
-        assert!(pending(client));
+        let w = gate.wait_for_stamp(client, REGION);
         h.handle(&stamp(client));
-        assert!(matches!(
-            gate.poll_read_gate(client, REGION, false),
-            ReadGatePoll::Resolved(_)
-        ));
+        assert_eq!(block_on(w.stamp()), Some(SwitchStamp::new(100, 5)));
     }
 
     /// SAFE-7: a `txn_source` outside the client namespace is no marker, so the
-    /// serve gate mints a server-side one instead.
+    /// stamp wait mints a server-side one instead.
     #[test]
     fn test_read_gate_marker_from_ctx_rejects_server_namespace() {
         let mut ctx = kvproto::kvrpcpb::Context::default();
@@ -2659,8 +2754,9 @@ mod tests {
         let stamped = sw.process(&encode(&read)).unwrap();
         let s = SwitchStamp::new(stamped.value, stamped.term);
         assert_eq!(s, SwitchStamp::new(42, 8));
-        assert_eq!(s.floor_in_term(8), Some(42));
-        assert_eq!(s.floor_in_term(9), None);
+        // A read stamped so is proposed with that index in that term; raft-rs uses
+        // it only in term 8 (`test_switch_hint_term_gate`).
+        assert_eq!(raftstore::store::switch_hint(Some(s)), (42, 8));
 
         // A tag miss (another region's slot, or nothing written yet) stamps
         // nothing usable.

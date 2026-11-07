@@ -817,7 +817,8 @@ lazy_static! {
     pub static ref SIDECHANNEL_READ_GATE_WAIT_DURATION: Histogram =
         register_histogram!(
             "tikv_raftstore_sidechannel_read_gate_wait_duration_seconds",
-            "Wall time a marked follower read waited on the switch read gate.",
+            "Wall time a follower read waited for its switch stamp before it was proposed (0 \
+             when the stamp was already there).",
             exponential_buckets(1e-5, 2.0, 20).unwrap()
         ).unwrap();
 
@@ -1074,4 +1075,35 @@ lazy_static! {
             "Is raft process busy or not",
             &["type"]
         ).unwrap();
+}
+
+// Follower read metrics, in their own block: more entries in the block above
+// exceed the crate's macro recursion limit.
+lazy_static! {
+    pub static ref RAFT_READ_INDEX_REPROPOSED_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "tikv_raftstore_read_index_reproposed_total",
+        "Replica reads re-proposed because a later read's answer moved the queue past them \
+             before they had a read index (LIVE-1), by whether the follower lease could serve \
+             them (lease_eligible) or only the leader (leader_only: assist read with no switch \
+             stamp, or one from another term).",
+        &["kind"]
+    )
+    .unwrap();
+    pub static ref SIDECHANNEL_READ_GATE_WAIT_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "tikv_raftstore_sidechannel_read_gate_wait_total",
+        "Follower reads that waited for their switch stamp before being proposed, by marker \
+             (client, server) and outcome (ready: already there; waited; deadline: proposed \
+             without one, so forwarded; replaced).",
+        &["marker", "outcome"]
+    )
+    .unwrap();
+    pub static ref SIDECHANNEL_READ_HINT_TOTAL: IntCounterVec = register_int_counter_vec!(
+        "tikv_raftstore_sidechannel_read_hint_total",
+        "Follower read index steps in assist mode (proposals, retries, re-proposals), by \
+             where the read's switch hint stood: met (the lease may serve it at once), \
+             above_commit (raft-rs holds it briefly or forwards it), other_term or no_stamp \
+             (forwarded to the leader).",
+        &["verdict"]
+    )
+    .unwrap();
 }

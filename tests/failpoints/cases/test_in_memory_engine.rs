@@ -1131,6 +1131,7 @@ fn test_apply_prepared_but_not_write() {
             cb: Callback::Read {
                 cb: Box::new(|_| {}),
                 tracker: Default::default(),
+                read_gate_stamp: None,
             },
         },
     );

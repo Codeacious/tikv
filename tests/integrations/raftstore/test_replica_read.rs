@@ -13,7 +13,7 @@ use std::{
 };
 
 use futures::executor::block_on;
-use kvproto::raft_serverpb::RaftMessage;
+use kvproto::{raft_cmdpb::RaftCmdResponse, raft_serverpb::RaftMessage};
 use pd_client::PdClient;
 use raft::eraftpb::MessageType;
 use raftstore::{store::ReadIndexContext, Result};
@@ -400,6 +400,157 @@ fn test_read_index_retry_lock_checking() {
                 .map_or(true, |r| !r.get_read_index().has_locked()),
         "{:?}",
         resp,
+    );
+}
+
+fn must_read_value(resp: &RaftCmdResponse, value: &[u8]) {
+    assert!(!resp.get_header().has_error(), "{:?}", resp);
+    assert_eq!(resp.get_responses()[0].get_get().get_value(), value);
+}
+
+// LIVE-1: a replica read without a lock-check request whose read index answer
+// is lost gets moved past by a later read's answer. Before the fix the follower
+// popped it without an index and aborted on
+// `assert!(read.read_index.is_some())`. Now it is re-proposed and both reads
+// succeed. raftstore v1 only (the fix is v1-only; raftstore-v2 ignores
+// `read_mode`).
+#[test]
+fn test_replica_read_jumped_over_after_lost_answer() {
+    let mut cluster = new_node_cluster(0, 2);
+    configure_for_lease_read(&mut cluster.cfg, Some(50), Some(20));
+    // Keep the retry timer out of the way: only the later read's answer may
+    // move the queue past the first read.
+    cluster.cfg.raft_store.raft_read_index_retry_interval_ticks = 1000;
+
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+
+    let rid = cluster.run_conf_change();
+    pd_client.must_add_peer(rid, new_peer(2, 2));
+    cluster.must_put(b"k1", b"v1");
+    must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
+    cluster.must_transfer_leader(1, new_peer(1, 1));
+
+    // Drop the leader's answer to the first replica read.
+    let filter = Box::new(
+        RegionPacketFilter::new(1, 2)
+            .direction(Direction::Recv)
+            .msg_type(MessageType::MsgReadIndexResp),
+    );
+    cluster.sim.wl().add_recv_filter(2, filter);
+    let r1 = cluster.get_region(b"k1");
+    let mut resp1 = async_read_on_peer(&mut cluster, new_peer(2, 2), r1.clone(), b"k1", true, true);
+    block_on_timeout(resp1.as_mut(), Duration::from_millis(300)).unwrap_err();
+
+    // The second read's answer is the first to arrive and moves the queue past
+    // the first read, which must be re-proposed rather than popped without an
+    // index.
+    cluster.sim.wl().clear_recv_filters(2);
+    let resp2 = async_read_on_peer(&mut cluster, new_peer(2, 2), r1, b"k1", true, true);
+    must_read_value(
+        &block_on_timeout(resp2, Duration::from_secs(1)).unwrap(),
+        b"v1",
+    );
+    must_read_value(
+        &block_on_timeout(resp1, Duration::from_secs(1)).unwrap(),
+        b"v1",
+    );
+}
+
+// LIVE-1 under `grant-leases`: a forwarded replica read is still waiting for
+// the leader when a later read is served from the follower's own lease, so the
+// later read's ReadState comes first. The leader's answers never reach the
+// follower and the retry timer is disabled, so the forwarded reads can complete
+// only by being re-proposed and served from the lease. raftstore v1 only.
+#[test]
+fn test_replica_read_forwarded_then_lease_served() {
+    // No switch gate in test clusters, so every re-proposal is lease-eligible.
+    let reproposed = || {
+        raftstore::store::metrics::RAFT_READ_INDEX_REPROPOSED_TOTAL
+            .with_label_values(&["lease_eligible"])
+            .get()
+    };
+    let mut cluster = new_node_cluster(0, 2);
+    configure_for_lease_read(&mut cluster.cfg, Some(50), Some(20));
+    cluster.cfg.raft_store.read_mode = "grant-leases".to_owned();
+    cluster.cfg.raft_store.raft_read_index_retry_interval_ticks = 1000;
+
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+
+    let no_grants = || {
+        Box::new(
+            RegionPacketFilter::new(1, 2)
+                .direction(Direction::Recv)
+                .msg_type(MessageType::MsgAskReadLeaseResp),
+        )
+    };
+    let no_answers = || {
+        Box::new(
+            RegionPacketFilter::new(1, 2)
+                .direction(Direction::Recv)
+                .msg_type(MessageType::MsgReadIndexResp),
+        )
+    };
+
+    // Peer 2 asks for a lease as soon as it joins, so hold back its grants
+    // until its first read has been forwarded.
+    let rid = cluster.run_conf_change();
+    cluster.sim.wl().add_recv_filter(2, no_grants());
+    pd_client.must_add_peer(rid, new_peer(2, 2));
+    cluster.must_put(b"k1", b"v1");
+    must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
+    cluster.must_transfer_leader(1, new_peer(1, 1));
+
+    // Every answer the leader sends to peer 2 is dropped for the rest of the
+    // test.
+    cluster.sim.wl().add_recv_filter(2, no_answers());
+
+    // Peer 2 holds no lease, so the first read is forwarded and its answer
+    // dropped.
+    let r1 = cluster.get_region(b"k1");
+    let mut first = async_read_on_peer(&mut cluster, new_peer(2, 2), r1.clone(), b"k1", true, true);
+    block_on_timeout(first.as_mut(), Duration::from_millis(300))
+        .expect_err("the first read must be forwarded, not served from a lease");
+
+    // Let grants through again; answers to peer 2 stay dropped.
+    cluster.sim.wl().clear_recv_filters(2);
+    cluster.sim.wl().add_recv_filter(2, no_answers());
+
+    // Read until one is served from the lease. Reads issued before the lease is
+    // granted are forwarded and wait like the first one.
+    let before = reproposed();
+    let mut waiting = vec![first];
+    let mut served = None;
+    for _ in 0..30 {
+        let mut resp =
+            async_read_on_peer(&mut cluster, new_peer(2, 2), r1.clone(), b"k1", true, true);
+        match block_on_timeout(resp.as_mut(), Duration::from_millis(100)) {
+            Ok(r) => {
+                served = Some(r);
+                break;
+            }
+            Err(_) => waiting.push(resp),
+        }
+    }
+    must_read_value(
+        &served.expect("no read was served from the follower lease"),
+        b"v1",
+    );
+
+    // Every read queued ahead of the lease-served one, the first included, was
+    // moved past without an index and must complete through a re-propose. The
+    // counter is process-wide, so other tests can only raise it.
+    let n = waiting.len() as u64;
+    for resp in waiting {
+        must_read_value(
+            &block_on_timeout(resp, Duration::from_secs(1)).unwrap(),
+            b"v1",
+        );
+    }
+    assert!(
+        reproposed() - before >= n,
+        "every forwarded read must go through a re-propose"
     );
 }
 

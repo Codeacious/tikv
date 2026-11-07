@@ -30,7 +30,7 @@ use tracker::{get_tls_tracker_token, TrackerToken};
 
 use super::{
     local_metrics::TimeTracker, region_meta::RegionMeta,
-    snapshot_backup::SnapshotBrWaitApplyRequest, FetchedLogs, RegionSnapshot,
+    snapshot_backup::SnapshotBrWaitApplyRequest, FetchedLogs, RegionSnapshot, SwitchStamp,
 };
 use crate::store::{
     fsm::apply::{CatchUpLogs, ChangeObserver, TaskRes as ApplyTaskRes},
@@ -101,10 +101,12 @@ pub enum Callback<S: Snapshot> {
 
         tracker: TrackerToken,
 
-        /// Assist read_mode: the client-minted switch read-gate marker this read is
-        /// waiting on, taken from the request body (`kvrpcpb::Context`) at the
-        /// `raftkv` boundary. `0` = no client marker.
-        read_gate_marker: u64,
+        /// Assist read_mode: the read's own switch stamp, awaited at the
+        /// `raftkv` boundary after the read began and before it is
+        /// proposed; raft-rs gets it as the read's hint. `None` = no
+        /// stamp, so a follower forwards the read to the leader
+        /// (`switch_hint`).
+        read_gate_stamp: Option<SwitchStamp>,
     },
     /// Write callback.
     Write {
@@ -137,18 +139,22 @@ where
         Callback::Read {
             cb,
             tracker,
-            read_gate_marker: 0,
+            read_gate_stamp: None,
         }
     }
 
-    /// Like [`Callback::read`], but carries a client-minted switch read-gate
-    /// marker (assist mode). `marker == 0` is identical to `read`.
-    pub fn read_with_marker(cb: BoxReadCallback<S>, marker: u64) -> Self {
-        let tracker = get_tls_tracker_token();
+    /// Like [`Callback::read`], but carries the read's switch stamp (assist
+    /// mode) and a tracker taken earlier: the caller waited for the stamp, and
+    /// may resume on another thread than the one the read's tracker is on.
+    pub fn read_with_stamp(
+        cb: BoxReadCallback<S>,
+        tracker: TrackerToken,
+        stamp: Option<SwitchStamp>,
+    ) -> Self {
         Callback::Read {
             cb,
             tracker,
-            read_gate_marker: marker,
+            read_gate_stamp: stamp,
         }
     }
 
@@ -244,13 +250,11 @@ pub trait ReadCallback: ErrorCallback {
     fn set_result(self, result: Self::Response);
     fn read_tracker(&self) -> Option<TrackerToken>;
 
-    /// Assist mode: the client-minted switch read-gate marker carried on this
-    /// read, or `0` when the client minted none (the serve gate then falls back
-    /// to a server-minted marker kept on the `ReadIndexRequest`). Defaults to
-    /// `0` so callback types outside the v1 rawkv read path — raftstore-v2's
-    /// `QueryResChannel` in particular — are unaffected.
-    fn read_gate_marker(&self) -> u64 {
-        0
+    /// Assist mode: the switch stamp carried on this read, or `None`. Defaults
+    /// to `None` so callback types outside the v1 rawkv read path,
+    /// raftstore-v2's `QueryResChannel` in particular, are unaffected.
+    fn read_gate_stamp(&self) -> Option<SwitchStamp> {
+        None
     }
 }
 
@@ -306,14 +310,14 @@ impl<S: Snapshot> ReadCallback for Callback<S> {
         Some(*tracker)
     }
 
-    fn read_gate_marker(&self) -> u64 {
+    fn read_gate_stamp(&self) -> Option<SwitchStamp> {
         let Callback::Read {
-            read_gate_marker, ..
+            read_gate_stamp, ..
         } = self
         else {
-            return 0;
+            return None;
         };
-        *read_gate_marker
+        *read_gate_stamp
     }
 }
 

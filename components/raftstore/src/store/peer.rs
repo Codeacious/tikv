@@ -117,7 +117,7 @@ use crate::{
             SplitCheckTask,
         },
         Callback, Config, GlobalReplicationState, PdTask, PeerMsg, ReadCallback, ReadIndexContext,
-        ReadResponse, TxnExt, WriteCallback, RAFT_INIT_LOG_INDEX,
+        ReadResponse, SwitchStamp, TxnExt, WriteCallback, RAFT_INIT_LOG_INDEX,
     },
     Error, Result,
 };
@@ -517,20 +517,30 @@ pub struct ReadyResult {
 pub fn propose_read_index<T: raft::Storage>(
     raft_group: &mut RawNode<T>,
     request: Option<&raft_cmdpb::ReadIndexRequest>,
-    region_id: u64,
 ) -> (Uuid, bool) {
-    propose_read_index_with_quorum(raft_group, request, region_id, false)
+    let last_pending_read_count = raft_group.raft.pending_read_count();
+    let last_ready_read_count = raft_group.raft.ready_read_count();
+
+    let id = Uuid::new_v4();
+    raft_group.read_index(ReadIndexContext::fields_to_bytes(id, request, None));
+
+    let pending_read_count = raft_group.raft.pending_read_count();
+    let ready_read_count = raft_group.raft.ready_read_count();
+    (
+        id,
+        pending_read_count == last_pending_read_count && ready_read_count == last_ready_read_count,
+    )
 }
 
-/// Like `propose_read_index`, but with `force_quorum` a leader under a leased
-/// read mode confirms the read with a heartbeat quorum round instead of serving
-/// it from raft's self-lease (`RawNode::read_index_quorum`). Only a leader can
-/// honour it; the switch hint only matters to a serving follower, so a forced
-/// read carries none.
+/// Like `propose_read_index`, for v1's `Peer` under the read-lease modes. With
+/// `force_quorum`, a leader under a leased read mode confirms the read with a
+/// heartbeat quorum round instead of serving it from raft's self-lease
+/// (`RawNode::read_index_quorum`); only a leader can honour it. Otherwise the
+/// read is stepped with its switch stamp (`step_read_index`).
 pub fn propose_read_index_with_quorum<T: raft::Storage>(
     raft_group: &mut RawNode<T>,
     request: Option<&raft_cmdpb::ReadIndexRequest>,
-    region_id: u64,
+    stamp: Option<SwitchStamp>,
     force_quorum: bool,
 ) -> (Uuid, bool) {
     let last_pending_read_count = raft_group.raft.pending_read_count();
@@ -541,17 +551,7 @@ pub fn propose_read_index_with_quorum<T: raft::Storage>(
     if force_quorum && raft_group.raft.state == raft::StateRole::Leader {
         raft_group.read_index_quorum(rctx);
     } else {
-        // Assist read_mode (Flow 2): stamp the read-index with this region's switch's saved
-        // ack-index so a serving follower can wait for proposed but yet-uncommitted log entries.
-        // The hint carries the term the switch stamped it in; raft-rs uses
-        // it only in that term and forwards the read otherwise (SAFE-1).
-        match crate::store::global_switch_read_gate() {
-            Some(gate) => {
-                let (hint, hint_term) = gate.read_index_hint(region_id);
-                raft_group.read_index_switch_hint(rctx, hint, hint_term)
-            }
-            None => raft_group.read_index(rctx),
-        }
+        step_read_index(raft_group, rctx, stamp);
     }
 
     let pending_read_count = raft_group.raft.pending_read_count();
@@ -560,6 +560,45 @@ pub fn propose_read_index_with_quorum<T: raft::Storage>(
         id,
         pending_read_count == last_pending_read_count && ready_read_count == last_ready_read_count,
     )
+}
+
+/// Steps a client read's read index into raft. In assist read mode the read
+/// carries its own switch stamp, awaited at the `raftkv` boundary after the
+/// read began, as raft-rs's hint; with none, a hint that forwards it to the
+/// leader (`switch_hint`). Every proposal and re-step of a client read goes
+/// through here, so a follower lease never serves an assist read below its
+/// own stamp. A leader ignores the hint. Otherwise a plain read index.
+fn step_read_index<T: raft::Storage>(
+    raft_group: &mut RawNode<T>,
+    rctx: Vec<u8>,
+    stamp: Option<SwitchStamp>,
+) {
+    // Tests: step the read as assist mode would with a stamp `n` entries past this
+    // node's commit index, in its term (`u64::MAX`: no stamp). Test clusters never
+    // install the switch gate, which is a process global.
+    let stamp_ahead: Option<u64> = (|| {
+        fail_point!("replica_read_stamp_ahead", |n| n
+            .and_then(|n| n.parse().ok()));
+        None
+    })();
+    if let Some(ahead) = stamp_ahead {
+        let (committed, term) = (raft_group.raft.raft_log.committed, raft_group.raft.term);
+        raft_group.read_index_switch_hint(rctx, committed.saturating_add(ahead), term);
+        return;
+    }
+    if crate::store::global_switch_read_gate().is_some() {
+        let (hint, hint_term) = crate::store::switch_hint(stamp);
+        let r = &raft_group.raft;
+        if r.state != StateRole::Leader {
+            let verdict = crate::store::hint_verdict(hint, hint_term, r.term, r.raft_log.committed);
+            SIDECHANNEL_READ_HINT_TOTAL
+                .with_label_values(&[verdict])
+                .inc();
+        }
+        raft_group.read_index_switch_hint(rctx, hint, hint_term);
+    } else {
+        raft_group.read_index(rctx);
+    }
 }
 
 pub fn should_renew_lease(
@@ -1450,6 +1489,9 @@ where
             "region_id" => self.region_id,
             "peer_id" => self.peer.get_id(),
         );
+        if let Some(gate) = crate::store::global_switch_read_gate() {
+            gate.set_local_follower(self.region_id, false);
+        }
 
         let (pending_create_peers, clean) = if self.local_first_replicate {
             let mut pending = pending_create_peers.lock().unwrap();
@@ -2502,6 +2544,11 @@ where
                     self.uncampaigned_new_regions = None;
                 }
                 _ => {}
+            }
+            // Assist read_mode: only a follower's replica reads wait for their switch stamp
+            // at the `raftkv` boundary (`SwitchReadGate::wait_for_stamp`).
+            if let Some(gate) = crate::store::global_switch_read_gate() {
+                gate.set_local_follower(self.region_id, ss.raft_state != StateRole::Leader);
             }
             self.on_leader_changed(ss.leader_id, self.term());
             ctx.coprocessor_host.on_role_change(
@@ -3681,106 +3728,50 @@ where
                 continue;
             }
 
-            assert!(read.read_index.is_some());
+            // LIVE-1: a later read's answer moved the queue past this one before it
+            // got an index of its own. Either its answer was lost, or (leased read
+            // modes) it is still in flight from the leader while a later read was
+            // served from this follower's lease. Re-propose it for a fresh read index
+            // rather than borrowing the later read's: the new read goes through
+            // `read_index` again, with its own switch stamp in assist mode, and can
+            // be served from the lease. A late answer for the old id is dropped,
+            // since `pop_front` took it out of `contexts`. A follower read holds one
+            // command, but a read left over from leadership (see `apply_reads`) may
+            // hold several; each is re-proposed on its own.
+            if read.read_index.is_none() {
+                let mut cmds = read.take_cmds();
+                debug!(
+                    "re-propose replica read jumped over without a read index";
+                    "region_id" => self.region_id,
+                    "peer_id" => self.peer_id(),
+                    "read_id" => ?read.id,
+                    "cmds" => cmds.len(),
+                );
+                RAFT_READ_INDEX_PENDING_COUNT.sub(cmds.len() as i64);
+                let assist = crate::store::global_switch_read_gate().is_some();
+                for (req, cb, _) in cmds.drain(..) {
+                    // An assist read without a stamp from this term can only be answered by
+                    // the leader (raft-rs forwards it). Counted apart: many of these would mean
+                    // forwarded reads keep being overtaken by lease-served ones.
+                    let leader_only = assist
+                        && !cb
+                            .read_gate_stamp()
+                            .is_some_and(|s| s.term == self.term() as u32);
+                    RAFT_READ_INDEX_REPROPOSED_TOTAL
+                        .with_label_values(&[if leader_only {
+                            "leader_only"
+                        } else {
+                            "lease_eligible"
+                        }])
+                        .inc();
+                    self.send_read_command(ctx, RaftCommand::new(req, cb));
+                }
+                continue;
+            }
+
             let is_read_index_request = read.cmds().len() == 1
                 && read.cmds()[0].0.get_requests().len() == 1
                 && read.cmds()[0].0.get_requests()[0].get_cmd_type() == CmdType::ReadIndex;
-
-            // Assist read_mode follower read gate.
-            // On a lease-holding follower, hold a marked read until the switch has given
-            // its current saved ack-index for that read's marker.
-            // The read is then served at or above the log index the switch answered with,
-            // provided the switch stamped that index in the term raft served
-            // the read in (SAFE-1); a stamp from any other term fails the read
-            // like a give-up.
-            // Non-blocking: on a miss re-queue and retry next poll rather than parking the
-            // poller. Skipped once resolved, so requeuing doesn't trigger a second switch query.
-            // Only a read whose index came from a follower lease is gated; leader-forwarded reads
-            // must not be gated (leader reads are always linearized with or without a switch answer).
-            if self.raft_group.is_asking_for_read_lease()
-                && read.served_by_follower_lease
-                && read.read_gate_resolved.is_none()
-                && let Some(gate) = crate::store::global_switch_read_gate()
-            {
-                // Use a client-minted marker if provided, and fall back to a
-                // stable server-minted marker if not. Stored on the read itself, so a
-                // it keeps the same marker across reenqueues.
-                let client_marker = read
-                    .cmds()
-                    .first()
-                    .map(|(_, cb, _)| cb.read_gate_marker())
-                    .unwrap_or(0);
-                let marker = if client_marker != 0 {
-                    client_marker
-                } else {
-                    if read.read_gate_marker == 0 {
-                        read.read_gate_marker = gate.mint_server_marker();
-                    }
-                    read.read_gate_marker
-                };
-                // Reuse the poll batch's cached clock read rather than sampling the clock every time.
-                let now = *ctx.current_time.get_or_insert_with(monotonic_raw_now);
-                let waited = (now - read.propose_time).to_std().unwrap_or_default();
-                let give_up = match gate.poll_read_gate(
-                    marker,
-                    self.region_id,
-                    waited >= crate::store::READ_GATE_GIVE_UP,
-                ) {
-                    crate::store::ReadGatePoll::Resolved(stamp) => {
-                        // Record how long this read waited on the switch gate.
-                        SIDECHANNEL_READ_GATE_WAIT_DURATION.observe(duration_to_sec(waited));
-                        // SAFE-1: the stamp covers this term's credits only if it was taken
-                        // in the term raft served the read in. A stamp from another term
-                        // (e.g. a deposed leader's write landed first after a switch reboot)
-                        // gives no floor.
-                        match stamp.floor_in_term(read.read_state_term) {
-                            Some(switch_index) => {
-                                read.read_gate_resolved = Some(switch_index);
-                                None
-                            }
-                            None => Some((
-                                "switch read gate stamp is from another term",
-                                stamp.term as u64,
-                            )),
-                        }
-                    }
-                    crate::store::ReadGatePoll::Pending => {
-                        self.pending_reads.push_front(read);
-                        break;
-                    }
-                    // Persistent sidechannel loss (e.g. the switch is down).
-                    crate::store::ReadGatePoll::GiveUp => Some(("switch read gate timed out", 0)),
-                };
-                if let Some((reason, stamp_term)) = give_up {
-                    // Fail the read cleanly instead of gating it forever or serving it
-                    // without a floor. The client retries, same as the applied-index-lag
-                    // path below.
-                    warn!(
-                        "switch read gate gave up, failing replica read";
-                        "reason" => reason,
-                        "region_id" => self.region_id,
-                        "peer_id" => self.peer_id(),
-                        "marker" => marker,
-                        "stamp_term" => stamp_term,
-                        "read_state_term" => read.read_state_term,
-                    );
-                    let mut response = cmd_resp::new_error(Error::ReadIndexNotReady {
-                        region_id: self.region_id,
-                        reason,
-                    });
-                    cmd_resp::bind_term(&mut response, self.term());
-                    self.respond_replica_read_error(&mut read, response);
-                    continue;
-                }
-            }
-
-            // The switch's answer may actually be lower than what the follower actually holds;
-            // we need the max of both to handle both cases (follower ahead or switch ahead).
-            if let Some(switch_index) = read.read_gate_resolved
-                && switch_index > read.read_index.unwrap()
-            {
-                read.read_index = Some(switch_index);
-            }
 
             let read_index = read.read_index.unwrap();
 
@@ -3839,15 +3830,7 @@ where
         let mut propose_time = None;
         let states = ready.read_states().iter().map(|state| {
             let read_index_ctx = ReadIndexContext::parse(state.request_ctx.as_slice()).unwrap();
-            (
-                read_index_ctx.id,
-                read_index_ctx.locked,
-                state.index,
-                // Carried only for a follower's assist gate: provenance, and the term
-                // its switch stamp must have been taken in (SAFE-1).
-                state.served_by_follower_lease,
-                state.term,
-            )
+            (read_index_ctx.id, read_index_ctx.locked, state.index)
         });
         // The follower may lost `ReadIndexResp`, so the pending_reads does not
         // guarantee the orders are consistent with read_states. `advance` will
@@ -4365,12 +4348,17 @@ where
 
         let read = self.pending_reads.back_mut().unwrap();
         debug_assert!(read.read_index.is_none());
-        self.raft_group
-            .read_index(ReadIndexContext::fields_to_bytes(
-                read.id,
-                read.addition_request.as_deref(),
-                None,
-            ));
+        // Re-stepped with the read's own switch stamp, as it was proposed. A follower
+        // read holds one command; anything else goes to the leader.
+        let stamp = match read.cmds() {
+            [(_, cb, _)] => cb.read_gate_stamp(),
+            _ => None,
+        };
+        step_read_index(
+            &mut self.raft_group,
+            ReadIndexContext::fields_to_bytes(read.id, read.addition_request.as_deref(), None),
+            stamp,
+        );
         debug!(
             "request to get a read index";
             "request_id" => ?read.id,
@@ -4496,7 +4484,8 @@ where
         // raftstore's lease renewal relies on it (`try_renew_leader_lease`),
         // so raft must not answer it from its own self-lease.
         let force_quorum = req.get_header().get_read_quorum();
-        let (id, dropped) = self.propose_read_index(request.as_ref(), force_quorum);
+        let (id, dropped) =
+            self.propose_read_index(request.as_ref(), cb.read_gate_stamp(), force_quorum);
         if dropped && self.is_leader() {
             // The message gets dropped silently, can't be handled anymore.
             apply::notify_stale_req(self.term(), cb);
@@ -4543,9 +4532,10 @@ where
     pub fn propose_read_index(
         &mut self,
         request: Option<&raft_cmdpb::ReadIndexRequest>,
+        stamp: Option<SwitchStamp>,
         force_quorum: bool,
     ) -> (Uuid, bool) {
-        propose_read_index_with_quorum(&mut self.raft_group, request, self.region_id, force_quorum)
+        propose_read_index_with_quorum(&mut self.raft_group, request, stamp, force_quorum)
     }
 
     /// Returns (minimal matched, minimal committed_index)

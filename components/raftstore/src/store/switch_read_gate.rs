@@ -3,29 +3,29 @@
 //! Shared state for the P4-switch-assisted follower read gate ("assist" mode).
 //!
 //! Owns the read-path half of sidechannel Flow 2 (see
-//! `src/server/udp_sidechannel.rs`). Two touch-points, both inside raftstore's
-//! `Peer`:
-//!
-//!   * propose-time hint — stamp the read-index with the region's cached switch
-//!     stamp and its term (`read_index_hint`), and
-//!   * serve-time gate  — hold a marked replica read until the switch answers
-//!     that read's marker (`poll_read_gate`), then serve at or above the
-//!     answered index, if the answer was stamped in the term raft served the
-//!     read in (`SwitchStamp::floor_in_term`).
+//! `src/server/udp_sidechannel.rs`). A follower read waits for its own switch
+//! stamp at the `raftkv` boundary, before it is proposed (`wait_for_stamp`),
+//! and raftstore proposes it with that stamp as raft-rs's hint
+//! (`switch_hint`). raft-rs serves the read from the follower lease only once
+//! commit has reached the stamp; otherwise it holds the read briefly and
+//! forwards it to the leader. A read with no stamp is forwarded. Only a read's
+//! own stamp is known to postdate the read, which is what makes it a safe
+//! hint (design note `2026-11-06-tikv-stamp-before-propose.md`).
 //!
 //! Every switch answer is a [`SwitchStamp`]: the region's register and the
 //! highest term among the writes the switch accepted for it since it booted.
-//! A stamp is used only in its own term (SAFE-1): after a switch reboot, a
+//! raft-rs uses a hint only in its own term (SAFE-1): after a switch reboot, a
 //! deposed leader's lower write can land first, and only this term's leader's
 //! writes cover this term's credits.
 //!
 //! The UDP side holds an `Arc` to the same `SwitchReadGate` and drives it
-//! (`update_switch_index`, `release_pending_batches`, the batched query loop),
+//! (`resolve_marker`, `release_pending_batches`, the batched query loop),
 //! reaching it through a process-global slot — raftstore cannot depend on the
 //! `tikv` crate. All state is keyed by region id.
 
 use std::{
     collections::{HashMap, HashSet},
+    future::Future,
     sync::{
         atomic::{AtomicU32, AtomicU64, Ordering},
         Arc, Mutex, OnceLock, RwLock,
@@ -34,10 +34,21 @@ use std::{
 };
 
 use crossbeam::channel::{unbounded, Receiver, Sender};
+use futures::{
+    channel::oneshot,
+    compat::Future01CompatExt,
+    future::{self, Either},
+};
+use tikv_util::{time::duration_to_sec, timer::SteadyTimer};
 
-/// How long a marked read may sit in the serve gate before it is failed. The
-/// query loop re-queries every 250ms, so this allows several retries.
-pub const READ_GATE_GIVE_UP: Duration = Duration::from_secs(1);
+use crate::store::metrics::{
+    SIDECHANNEL_READ_GATE_WAIT_DURATION, SIDECHANNEL_READ_GATE_WAIT_TOTAL,
+};
+
+/// How long a follower read waits for its switch stamp before it is proposed
+/// without one, which forwards it to the leader. Matches etcd's
+/// `ReadGateDeadlineMillis`.
+pub const READ_GATE_DEADLINE: Duration = Duration::from_millis(50);
 
 /// Cadence of the leader-side idle refresh (`SwitchRegisterRefresher`). An idle
 /// region is refreshed every *other* tick, because the refresh's own reflection
@@ -57,15 +68,16 @@ const RESOLVED_TTL: Duration = Duration::from_secs(1);
 /// region ids name raft groups, and the stamp's index is in that group's log.
 type MarkerKey = (u64, u64);
 
-/// Switch answers waiting to be claimed by their read's next serve-gate poll,
-/// by (marker, region). Two generations: an insert at least `RESOLVED_TTL`
-/// after the last rotation makes the current one the previous one and drops
-/// the old previous one. Rotation is driven by inserts only, so an unclaimed
-/// answer is gone one to two periods after it arrived only while answers keep
-/// arriving; with none, it stays. That is only memory, and an idle map does
-/// not grow. Safety never relies on it: keys do not recur (random client
-/// namespaces, `is_client_marker` at both entry points, batch release only
-/// for keys still in `pending`).
+/// Switch answers no read has claimed yet, by (marker, region): a client's
+/// gate packet that landed before its read started waiting, or an orphan.
+/// Two generations: an insert at least `RESOLVED_TTL` after the last rotation
+/// makes the current one the previous one and drops the old previous one.
+/// Rotation is driven by inserts only, so an unclaimed answer is gone one to
+/// two periods after it arrived only while answers keep arriving; with none,
+/// it stays. That is only memory, and an idle map does not grow. Safety never
+/// relies on it: keys do not recur (random client namespaces,
+/// `is_client_marker` at both entry points, batch release only for keys still
+/// in `pending`).
 struct ResolvedStamps {
     curr: HashMap<MarkerKey, SwitchStamp>,
     prev: HashMap<MarkerKey, SwitchStamp>,
@@ -103,6 +115,28 @@ impl ResolvedStamps {
     }
 }
 
+/// The stamps for (marker, region) keys and the reads waiting for one, under
+/// one lock: a stamp either finds its read waiting or is kept for it.
+struct Answers {
+    stamps: ResolvedStamps,
+    waiting: HashMap<MarkerKey, oneshot::Sender<SwitchStamp>>,
+}
+
+impl Answers {
+    /// Hands `stamp` to the read waiting on `key`, or keeps it for the read
+    /// that is about to wait (a client's packet usually lands before its RPC).
+    fn deliver(&mut self, key: MarkerKey, stamp: SwitchStamp) {
+        match self.waiting.remove(&key) {
+            // A wait that just reached its deadline may already have dropped
+            // its receiver; the stamp then goes unused, like any late answer.
+            Some(tx) => {
+                let _ = tx.send(stamp);
+            }
+            None => self.stamps.insert(key, stamp),
+        }
+    }
+}
+
 /// Whether `marker` lies in the client namespace: a nonzero upper 32 bits. The
 /// zero-upper-32 namespace belongs to this store's server-minted read markers
 /// (`mint_server_marker`), which restart at 1 on every start; a client marker
@@ -117,8 +151,8 @@ pub fn is_client_marker(marker: u64) -> bool {
 /// a switch that rebooted answers until the next tapped `MsgAppend` rewrites
 /// its register.
 ///
-/// A 0 never resolves a gated read and is never cached as a region's latest
-/// index: the gate fails closed and the read waits or gives up.
+/// A 0 never resolves a waiting read: the gate fails closed, and the read waits
+/// or is proposed without a stamp.
 const INVALID_SWITCH_INDEX: u64 = 0;
 
 /// What a switch reported for one region: its register (`index`) and the
@@ -127,8 +161,8 @@ const INVALID_SWITCH_INDEX: u64 = 0;
 ///
 /// A stamp with a zero index or a zero term carries no information: the switch
 /// has accepted no write for the region since it booted, or its slot holds
-/// another region. Such a stamp never resolves a read, never releases a batch
-/// and is never cached.
+/// another region. Such a stamp never resolves a read and never releases a
+/// batch.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SwitchStamp {
     pub index: u64,
@@ -144,48 +178,64 @@ impl SwitchStamp {
     pub fn is_usable(&self) -> bool {
         self.index != INVALID_SWITCH_INDEX && self.term != 0
     }
+}
 
-    /// The floor this stamp puts on a read that raft produced in
-    /// `read_state_term` (raft-rs `ReadState::term`): its index, but only if
-    /// the stamp was taken in that same term, compared on the 32 bits the
-    /// switch carries (SAFE-1). `None` means the stamp says nothing about
-    /// that term, and the read must not be served on it.
-    pub fn floor_in_term(&self, read_state_term: u64) -> Option<u64> {
-        if self.is_usable() && self.term == read_state_term as u32 {
-            Some(self.index)
-        } else {
-            None
-        }
-    }
+/// Hint for a follower read with no stamp. It travels to raft-rs as
+/// `MsgReadIndex.commit`: an index this node must have committed before a lease
+/// holder may serve the read locally. Naming an index no node can have
+/// committed makes raft's ordinary rules forward the read to the leader, with
+/// no switch-shaped special case in the library.
+pub const UNKNOWN_SWITCH_INDEX_HINT: u64 = u64::MAX;
 
-    /// Lexicographic order key: the term first, then the index.
-    fn order_key(&self) -> (u32, u64) {
-        (self.term, self.index)
+/// The `(hint, hint_term)` a follower read is proposed with in assist mode
+/// (raft-rs `RawNode::read_index_switch_hint`): its own switch stamp, or, with
+/// none, an index no node can have committed, which forwards the read to the
+/// leader. Never 0, which raft-rs reads as "no requirement", and never another
+/// read's stamp: only a read's own stamp is known to postdate it. raft-rs uses
+/// a nonzero hint only if `hint_term` equals its term in 32 bits at serve time,
+/// and forwards the read otherwise (SAFE-1).
+pub fn switch_hint(stamp: Option<SwitchStamp>) -> (u64, u64) {
+    match stamp {
+        Some(s) if s.is_usable() => (s.index, u64::from(s.term)),
+        _ => (UNKNOWN_SWITCH_INDEX_HINT, 0),
     }
 }
 
-/// Propose-time hint for a region the switch has told us nothing about
-/// (`latest_switch_index == INVALID_SWITCH_INDEX`).
-///
-/// The hint travels to raft-rs as `MsgReadIndex.commit`: an index this node
-/// must have committed before a lease holder may serve the read locally. Naming
-/// an index no node can have committed makes raft's ordinary rules forward the
-/// read to the leader, with no switch-shaped special case in the library.
-const UNKNOWN_SWITCH_INDEX_HINT: u64 = u64::MAX;
+/// Where a follower read's `(hint, hint_term)` stands when it is stepped at a
+/// follower in `term` that has committed `committed`, by raft-rs's serve test:
+/// `met` (the lease may serve it at once), `above_commit` (raft-rs holds it
+/// briefly or forwards it), or `other_term` / `no_stamp` (raft-rs forwards
+/// it). For metrics only.
+pub fn hint_verdict(hint: u64, hint_term: u64, term: u64, committed: u64) -> &'static str {
+    if hint == UNKNOWN_SWITCH_INDEX_HINT {
+        "no_stamp"
+    } else if hint_term as u32 != term as u32 {
+        "other_term"
+    } else if hint > committed {
+        "above_commit"
+    } else {
+        "met"
+    }
+}
 
-/// Outcome of a serve-gate poll (`SwitchReadGate::poll_read_gate`).
-pub enum ReadGatePoll {
-    /// The switch confirmed this marker with this stamp (always usable). The
-    /// caller serves the read at *or above* its index, and only if it was
-    /// stamped in the term raft served the read in
-    /// (`SwitchStamp::floor_in_term`).
-    Resolved(SwitchStamp),
-    /// Not yet confirmed and still within the give-up window; the caller
-    /// re-queues the read and retries on the next poll.
-    Pending,
-    /// The read waited past `READ_GATE_GIVE_UP`; the marker has been dropped
-    /// from tracking and the caller should fail the read.
-    GiveUp,
+/// A read's switch stamp, or the wait for it
+/// (`SwitchReadGate::wait_for_stamp`).
+pub enum StampWait<F> {
+    /// The stamp was already here: its client's gate packet landed first.
+    Ready(SwitchStamp),
+    /// The read is registered; this resolves with its stamp, or with `None` at
+    /// the deadline.
+    Pending(F),
+}
+
+impl<F: Future<Output = Option<SwitchStamp>>> StampWait<F> {
+    /// The stamp, waiting for it if need be.
+    pub async fn stamp(self) -> Option<SwitchStamp> {
+        match self {
+            StampWait::Ready(stamp) => Some(stamp),
+            StampWait::Pending(wait) => wait.await,
+        }
+    }
 }
 
 /// A group of read-gate markers sharing one in-flight local switch query
@@ -199,12 +249,6 @@ struct PendingMarkerBatch {
 
 /// Shared switch read-gate state. Cloneable handle via `Arc`.
 pub struct SwitchReadGate {
-    /// Latest switch stamp, per region: the lexicographic max of (term, index)
-    /// over every usable stamp seen for the region. A newer term replaces the
-    /// stamp even with a lower index: a hint is used only in its own term. The
-    /// `RwLock` guards only the map container; each region has its own small
-    /// lock, so different regions never serialize on the hot path.
-    latest: RwLock<HashMap<u64, Arc<Mutex<SwitchStamp>>>>,
     /// Counter for server-minted markers. They are masked into the low 32
     /// bits so they cannot collide with client-minted markers, which have
     /// nonzero upper 32 bits.
@@ -214,17 +258,19 @@ pub struct SwitchReadGate {
     batch_incarnation: u32,
     /// Lower half of the last batch id minted.
     batch_seq: AtomicU32,
-    /// (marker, region) pairs registered by the serve gate and awaiting
-    /// confirmation.
+    /// (marker, region) pairs a read is waiting on; the query loop asks the
+    /// switch about those still here when its batch closes.
     pending: Mutex<HashSet<MarkerKey>>,
-    /// Confirmed (marker, region) -> switch stamp, consumed by the next
-    /// serve-gate poll; unclaimed entries expire.
-    resolved: Mutex<ResolvedStamps>,
+    /// Stamps no read has claimed yet, and the reads waiting for one.
+    answers: Mutex<Answers>,
     /// Batches with an in-flight `QuerySwitchIndex`, each for a single region.
     pending_batches: Mutex<Vec<PendingMarkerBatch>>,
     /// Newly-pending `(marker, region_id)` pairs handed to the sidechannel's
     /// batched query loop.
     pending_markers_tx: Sender<(u64, u64)>,
+    /// Regions whose peer on this store is, as raftstore last published, not
+    /// the leader. Only their replica reads wait for a stamp.
+    followers: RwLock<HashSet<u64>>,
 }
 
 /// A random, nonzero batch-id upper half.
@@ -241,64 +287,20 @@ impl SwitchReadGate {
     pub fn new() -> (Arc<SwitchReadGate>, Receiver<(u64, u64)>) {
         let (tx, rx) = unbounded();
         let gate = Arc::new(SwitchReadGate {
-            latest: RwLock::new(HashMap::new()),
             // Start at 1 so 0 stays a reserved "no marker" sentinel.
             marker_seq: AtomicU64::new(1),
             batch_incarnation: new_batch_incarnation(),
             batch_seq: AtomicU32::new(0),
             pending: Mutex::new(HashSet::new()),
-            resolved: Mutex::new(ResolvedStamps::new(Instant::now())),
+            answers: Mutex::new(Answers {
+                stamps: ResolvedStamps::new(Instant::now()),
+                waiting: HashMap::new(),
+            }),
             pending_batches: Mutex::new(Vec::new()),
             pending_markers_tx: tx,
+            followers: RwLock::new(HashSet::new()),
         });
         (gate, rx)
-    }
-
-    /// Returns the region's latest-stamp slot, creating it under a brief write
-    /// lock on first sight.
-    fn region_stamp(&self, region_id: u64) -> Arc<Mutex<SwitchStamp>> {
-        if let Some(a) = self.latest.read().unwrap().get(&region_id) {
-            return a.clone();
-        }
-        self.latest
-            .write()
-            .unwrap()
-            .entry(region_id)
-            .or_insert_with(|| Arc::new(Mutex::new(SwitchStamp::default())))
-            .clone()
-    }
-
-    /// Latest switch stamp for `region_id` (the (term, index) max), or the
-    /// all-zero, unusable stamp if the switch has told us nothing. Does not
-    /// insert a map entry. The raw cache; `read_index_hint` is the propose-time
-    /// view of it.
-    pub fn latest_switch_stamp(&self, region_id: u64) -> SwitchStamp {
-        self.latest
-            .read()
-            .unwrap()
-            .get(&region_id)
-            .map(|a| *a.lock().unwrap())
-            .unwrap_or_default()
-    }
-
-    /// The `(hint, hint_term)` to put on this region's `MsgReadIndex` (raft-rs
-    /// `RawNode::read_index_switch_hint`): the cached stamp's index and term,
-    /// or `(UNKNOWN_SWITCH_INDEX_HINT, 0)` when the cache is still empty,
-    /// which forwards the read to the leader. raft-rs uses a nonzero hint
-    /// only if `hint_term` equals its term in 32 bits at serve time, and
-    /// forwards the read otherwise (SAFE-1).
-    ///
-    /// "Never stamped" and "the switch has nothing saved right now" are the
-    /// same condition and take the same path — the cache already carries
-    /// both, so there is no per-region "ever stamped" bookkeeping and must
-    /// not be.
-    pub fn read_index_hint(&self, region_id: u64) -> (u64, u64) {
-        let stamp = self.latest_switch_stamp(region_id);
-        if stamp.is_usable() {
-            (stamp.index, u64::from(stamp.term))
-        } else {
-            (UNKNOWN_SWITCH_INDEX_HINT, 0)
-        }
     }
 
     /// Mints a server-side marker for a marker-less read, in the low 32-bit
@@ -313,76 +315,109 @@ impl SwitchReadGate {
         }
     }
 
-    /// Non-blocking serve-gate poll. Returns `Resolved(stamp)` once the switch
-    /// has confirmed `marker`; otherwise registers it (issuing a batched
-    /// local query on first sight) and returns `Pending`, so the caller
-    /// re-queues the read — the raftstore poller thread is never parked.
-    ///
-    /// `expired` is set by the caller once the read has waited past
-    /// `READ_GATE_GIVE_UP`; an expired, still-unresolved marker is dropped from
-    /// tracking and `GiveUp` returned.
-    pub fn poll_read_gate(&self, marker: u64, region_id: u64, expired: bool) -> ReadGatePoll {
-        // Acquire `resolved` before `pending`, matching `update_switch_index`.
-        let mut resolved = self.resolved.lock().unwrap();
-        // An unusable stamp carries no index floor, so it is not a resolution.
-        // Both writers already refuse to record one; restated here at the single
-        // consumption point.
-        let key = (marker, region_id);
-        if let Some(stamp) = resolved.remove(&key)
-            && stamp.is_usable()
-        {
-            drop(resolved);
-            self.pending.lock().unwrap().remove(&key);
-            return ReadGatePoll::Resolved(stamp);
+    /// Records whether this store's peer of `region_id` is a follower (not the
+    /// leader), from raftstore's role changes. A stale value costs latency, not
+    /// safety: a follower read proposed without a stamp is forwarded, and a
+    /// leader ignores the hint.
+    pub fn set_local_follower(&self, region_id: u64, follower: bool) {
+        let mut followers = self.followers.write().unwrap();
+        if follower {
+            followers.insert(region_id);
+        } else {
+            followers.remove(&region_id);
         }
-        if expired {
-            // Drop from `pending` so `retain_pending` stops re-querying and a
-            // batch release can't re-resolve it. A late client `MsgReadIndex` can
-            // still leave an orphaned `resolved` entry; it expires.
-            drop(resolved);
-            self.pending.lock().unwrap().remove(&key);
-            return ReadGatePoll::GiveUp;
-        }
-        let newly = self.pending.lock().unwrap().insert(key);
-        drop(resolved);
-        if newly {
-            // Unbounded, so this never blocks; the query loop is the batching
-            // point.
-            let _ = self.pending_markers_tx.try_send((marker, region_id));
-        }
-        ReadGatePoll::Pending
     }
 
-    /// Raises `region_id`'s cached stamp to the (term, index) max and, for a
-    /// nonzero marker, resolves it. Called by the socket side on inbound
-    /// `MsgReadIndex` (client, switch-tagged) and — with `marker == 0` — on
-    /// `MsgAskAckIndexResp` (cache update only; batch release is separate).
-    pub fn update_switch_index(&self, marker: u64, region_id: u64, stamp: SwitchStamp) {
-        // A zero index or term carries no information (see `SwitchStamp`): don't
-        // cache it, don't let it resolve a gated read.
-        if !stamp.is_usable() {
-            return;
-        }
-        // region_id 0 is the placeholder sentinel and the switch always serves 0
-        // for it, so skip the cache entry. The marker is still resolved below, so
-        // a placeholder read falls through to the host-ack path instead of gating
-        // until give-up.
-        if region_id != 0 {
-            let slot = self.region_stamp(region_id);
-            let mut latest = slot.lock().unwrap();
-            if stamp.order_key() > latest.order_key() {
-                *latest = stamp;
+    /// Whether replica reads of `region_id` should wait for a stamp here.
+    pub fn is_local_follower(&self, region_id: u64) -> bool {
+        self.followers.read().unwrap().contains(&region_id)
+    }
+
+    /// Waits, at most `READ_GATE_DEADLINE`, for the switch stamp of the read
+    /// keyed by (`marker`, `region_id`), before the read is proposed:
+    ///
+    ///   * the stamp the switch put on the client's gate packet, for a client
+    ///     marker (the packet usually lands before its RPC, and then waits in
+    ///     `answers`), or
+    ///   * the answer to a batched query of the region's register, for a
+    ///     server-minted marker, or for a client marker whose packet has not
+    ///     landed by the time the query loop's batch closes.
+    ///
+    /// Either was taken after the read began: the client sends its packet once
+    /// the read has begun, and a batch is recorded after its reads joined and
+    /// queried after that. `None` at the deadline; the read is then proposed
+    /// without a stamp, which forwards it to the leader.
+    ///
+    /// The wait is registered when this is called, not when the future is
+    /// first polled. A stamp that is already here comes back as `Ready`, so the
+    /// common case (packet first) needs no future at all. Callers drive the
+    /// future to completion: one dropped early leaves its read registered, and
+    /// queried, until the switch answers for it.
+    pub fn wait_for_stamp(
+        self: &Arc<Self>,
+        marker: u64,
+        region_id: u64,
+    ) -> StampWait<impl Future<Output = Option<SwitchStamp>> + Send + 'static> {
+        let key = (marker, region_id);
+        let kind = if is_client_marker(marker) {
+            "client"
+        } else {
+            "server"
+        };
+        let start = Instant::now();
+        // Acquire `answers` before `pending`, as the writers do, so a stamp
+        // either is already in `answers` or finds this read waiting.
+        let rx = {
+            let mut answers = self.answers.lock().unwrap();
+            if let Some(stamp) = answers.stamps.remove(&key) {
+                observe_wait(kind, "ready", start);
+                return StampWait::Ready(stamp);
             }
-        }
-        if marker == 0 {
+            let (tx, rx) = oneshot::channel();
+            answers.waiting.insert(key, tx);
+            if self.pending.lock().unwrap().insert(key) {
+                // Unbounded, so this never blocks; the query loop is the
+                // batching point.
+                let _ = self.pending_markers_tx.try_send(key);
+            }
+            rx
+        };
+        let gate = self.clone();
+        StampWait::Pending(async move {
+            let deadline = SteadyTimer::default().delay(READ_GATE_DEADLINE).compat();
+            let (stamp, outcome) = match future::select(rx, deadline).await {
+                Either::Left((Ok(stamp), _)) => (Some(stamp), "waited"),
+                // Another wait for the same key replaced this one, and owns
+                // the key now.
+                Either::Left((Err(_), _)) => (None, "replaced"),
+                // Stop waiting and stop querying for the key. A late answer
+                // then finds it gone from `pending` and resolves nothing.
+                Either::Right(_) => {
+                    gate.answers.lock().unwrap().waiting.remove(&key);
+                    gate.pending.lock().unwrap().remove(&key);
+                    (None, "deadline")
+                }
+            };
+            observe_wait(kind, outcome, start);
+            stamp
+        })
+    }
+
+    /// Resolves (`marker`, `region_id`) with the stamp the switch put on a
+    /// client's gate packet, for the read waiting on it or about to. Called by
+    /// the socket side on inbound `MsgReadIndex` (client, switch-tagged).
+    pub fn resolve_marker(&self, marker: u64, region_id: u64, stamp: SwitchStamp) {
+        // A zero index or term carries no information (see `SwitchStamp`): it
+        // never resolves a read.
+        if !stamp.is_usable() || marker == 0 {
             return;
         }
         // Keyed by the stamp's region: a read in another region never claims
         // it (SAFE-6), and waits for its own region's answer instead.
         let key = (marker, region_id);
-        let mut resolved = self.resolved.lock().unwrap();
+        let mut answers = self.answers.lock().unwrap();
         self.pending.lock().unwrap().remove(&key);
-        resolved.insert(key, stamp);
+        answers.deliver(key, stamp);
     }
 
     /// Mints the next batch id: `batch_incarnation` in the upper 32 bits, the
@@ -445,11 +480,8 @@ impl SwitchReadGate {
     /// A response for one region never releases another region's reads.
     ///
     /// An unusable `answered` (zero index or term) releases nothing — there is
-    /// no floor to hand out — and the markers stay pending for the query
+    /// no stamp to hand out — and the markers stay pending for the query
     /// loop to retry.
-    ///
-    /// The floor is `answered`, not the cached `latest_switch_stamp`: a higher
-    /// cache only means another read sampled the same register later.
     ///
     /// The caller has checked `is_own_batch_marker(batch_marker)` (SAFE-3), so
     /// only the lower halves are compared, as RFC 1982 serial numbers: the
@@ -482,22 +514,31 @@ impl SwitchReadGate {
         if released.is_empty() {
             return;
         }
-        let mut resolved = self.resolved.lock().unwrap();
+        let mut answers = self.answers.lock().unwrap();
         let mut pending = self.pending.lock().unwrap();
         for batch in released {
             for marker in batch.markers {
                 let key = (marker, batch.region_id);
                 if pending.remove(&key) {
-                    resolved.insert(key, answered);
+                    answers.deliver(key, answered);
                 }
             }
         }
     }
 }
 
+/// Counts a stamp wait's outcome, by marker namespace, and the time it added
+/// to the read: 0 for a stamp that was already there.
+fn observe_wait(kind: &str, outcome: &str, start: Instant) {
+    SIDECHANNEL_READ_GATE_WAIT_TOTAL
+        .with_label_values(&[kind, outcome])
+        .inc();
+    SIDECHANNEL_READ_GATE_WAIT_DURATION.observe(duration_to_sec(start.elapsed()));
+}
+
 /// Process-global switch read gate, published by the sidechannel at startup and
-/// read back by every `Peer`. `None` when `read_mode != "assist"`, in which
-/// case the read path is unchanged.
+/// read back by raftstore and the `raftkv` read path. `None` when
+/// `read_mode != "assist"`, in which case the read path is unchanged.
 static GLOBAL_SWITCH_READ_GATE: OnceLock<Arc<SwitchReadGate>> = OnceLock::new();
 
 /// Publishes the process-global switch read gate. Idempotent: a second call is
@@ -552,6 +593,8 @@ pub fn global_switch_register_refresher() -> Option<&'static Arc<dyn SwitchRegis
 
 #[cfg(test)]
 mod tests {
+    use futures::executor::block_on;
+
     use super::*;
 
     const REGION: u64 = 7;
@@ -561,114 +604,98 @@ mod tests {
         SwitchStamp::new(index, TERM)
     }
 
-    fn poll(gate: &SwitchReadGate, marker: u64, expired: bool) -> ReadGatePoll {
-        gate.poll_read_gate(marker, REGION, expired)
+    /// Whether a read is still waiting on (`marker`, `region`).
+    fn waiting(gate: &SwitchReadGate, marker: u64, region: u64) -> bool {
+        !gate.retain_pending(&[(marker, region)]).is_empty()
     }
 
-    fn assert_pending(poll: ReadGatePoll) {
-        match poll {
-            ReadGatePoll::Pending => {}
-            ReadGatePoll::Resolved(s) => panic!("expected Pending, got Resolved({:?})", s),
-            ReadGatePoll::GiveUp => panic!("expected Pending, got GiveUp"),
-        }
-    }
-
-    fn assert_resolved(poll: ReadGatePoll, want: SwitchStamp) {
-        match poll {
-            ReadGatePoll::Resolved(s) => assert_eq!(s, want),
-            ReadGatePoll::Pending => panic!("expected Resolved({:?}), got Pending", want),
-            ReadGatePoll::GiveUp => panic!("expected Resolved({:?}), got GiveUp", want),
-        }
-    }
-
-    /// A 0 answer must not release a gated read; a real one must. raft-rs twin:
-    /// `test_switch_stamp_unstamped_read_is_not_held`.
+    /// A client's stamp that landed before its read started waiting is handed
+    /// over at once; one that lands while the read waits wakes it.
     #[test]
-    fn test_zero_switch_index_never_resolves_a_gated_read() {
+    fn test_wait_takes_its_stamp_before_or_while_waiting() {
         let (gate, _rx) = SwitchReadGate::new();
-        let marker = gate.mint_server_marker();
+        let first = 0xABCD_0000_0000_0001;
+        gate.resolve_marker(first, REGION, st(40));
+        assert_eq!(
+            block_on(gate.wait_for_stamp(first, REGION).stamp()),
+            Some(st(40))
+        );
+        assert!(!waiting(&gate, first, REGION));
 
-        assert_pending(poll(&gate, marker, false));
+        let later = 0xABCD_0000_0000_0002;
+        let w = gate.wait_for_stamp(later, REGION);
+        assert!(waiting(&gate, later, REGION));
+        gate.resolve_marker(later, REGION, st(41));
+        assert!(!waiting(&gate, later, REGION));
+        assert_eq!(block_on(w.stamp()), Some(st(41)));
+    }
+
+    /// A newly waiting read is handed to the query loop once; a client marker
+    /// too, in case its packet was lost.
+    #[test]
+    fn test_waiting_read_is_queued_for_a_query() {
+        let (gate, rx) = SwitchReadGate::new();
+        let client = 0xABCD_0000_0000_0003;
+        let server = gate.mint_server_marker();
+        let _c = gate.wait_for_stamp(client, REGION);
+        let _s = gate.wait_for_stamp(server, REGION);
+        let queued: Vec<(u64, u64)> = rx.try_iter().collect();
+        assert_eq!(queued, vec![(client, REGION), (server, REGION)]);
+    }
+
+    /// A 0 answer must not resolve a waiting read; a real one must. raft-rs
+    /// twin: `test_switch_stamp_unstamped_read_is_not_held`.
+    #[test]
+    fn test_zero_switch_index_never_resolves_a_waiting_read() {
+        let (gate, _rx) = SwitchReadGate::new();
+        let marker = 0xABCD_0000_0000_0004;
+        let w = gate.wait_for_stamp(marker, REGION);
         // The switch answers this marker with its reserved invalid value.
-        gate.update_switch_index(marker, REGION, st(0));
-        assert_pending(poll(&gate, marker, false));
+        gate.resolve_marker(marker, REGION, st(0));
+        assert!(waiting(&gate, marker, REGION));
 
-        // A real answer releases it, at that index and term.
-        gate.update_switch_index(marker, REGION, st(42));
-        assert_resolved(poll(&gate, marker, false), st(42));
+        // A real answer resolves it, at that index and term.
+        gate.resolve_marker(marker, REGION, st(42));
+        assert_eq!(block_on(w.stamp()), Some(st(42)));
     }
 
     /// SAFE-1: a stamp without a term (the switch has accepted no write for the
     /// region since it booted, or its slot holds another region) is no
-    /// information either: it neither resolves a read nor reaches the cache.
+    /// information either, from a client packet or a batch answer.
     #[test]
     fn test_zero_term_stamp_is_unusable() {
         let (gate, _rx) = SwitchReadGate::new();
         let marker = gate.mint_server_marker();
-        assert_pending(poll(&gate, marker, false));
+        let w = gate.wait_for_stamp(marker, REGION);
 
-        gate.update_switch_index(marker, REGION, SwitchStamp::new(400, 0));
-        assert_pending(poll(&gate, marker, false));
-        assert_eq!(gate.latest_switch_stamp(REGION), SwitchStamp::default());
-        assert_eq!(gate.read_index_hint(REGION), (u64::MAX, 0));
-
+        gate.resolve_marker(marker, REGION, SwitchStamp::new(400, 0));
+        assert!(waiting(&gate, marker, REGION));
         let batch = gate.next_marker();
         gate.record_pending_batch(batch, REGION, vec![marker]);
         gate.release_pending_batches(batch, REGION, SwitchStamp::new(400, 0));
-        assert_pending(poll(&gate, marker, false));
+        assert!(waiting(&gate, marker, REGION));
 
-        gate.update_switch_index(marker, REGION, SwitchStamp::new(500, 6));
-        assert_resolved(poll(&gate, marker, false), SwitchStamp::new(500, 6));
+        gate.resolve_marker(marker, REGION, SwitchStamp::new(500, 6));
+        assert_eq!(block_on(w.stamp()), Some(SwitchStamp::new(500, 6)));
     }
 
-    /// A 0 neither raises the cache from 0 nor lowers it once real. Contract
-    /// test only — the ordering underneath already ignores a 0.
+    /// A batch answer wakes the reads in it, at the batch's own stamp, term
+    /// included: the register when the switch answered that query, which it
+    /// did after the reads joined the batch.
     #[test]
-    fn test_zero_switch_index_is_not_cached() {
+    fn test_batch_answer_wakes_its_reads() {
         let (gate, _rx) = SwitchReadGate::new();
-        gate.update_switch_index(0, REGION, st(0));
-        assert_eq!(gate.latest_switch_stamp(REGION), SwitchStamp::default());
-
-        gate.update_switch_index(0, REGION, st(90));
-        assert_eq!(gate.latest_switch_stamp(REGION), st(90));
-
-        // A later reboot answer neither lowers nor clears the cache.
-        gate.update_switch_index(0, REGION, st(0));
-        assert_eq!(gate.latest_switch_stamp(REGION), st(90));
-    }
-
-    /// SAFE-1: the per-region cache is the lexicographic max of (term, index).
-    /// Within a term it only rises; a later term replaces it even with a lower
-    /// index (a hint is used only in its own term); an earlier term never
-    /// replaces it, however high its index.
-    #[test]
-    fn test_cache_orders_by_term_then_index() {
-        let (gate, _rx) = SwitchReadGate::new();
-        let steps: [((u64, u32), (u64, u32)); 6] = [
-            ((100, 5), (100, 5)), // first stamp
-            ((90, 5), (100, 5)),  // lower index, same term: no change
-            ((120, 5), (120, 5)), // higher index, same term
-            ((60, 6), (60, 6)),   // later term, lower index: replaces
-            ((900, 5), (60, 6)),  // earlier term, higher index: ignored
-            ((61, 6), (61, 6)),   // higher index in the current term
-        ];
-        for (i, ((idx, term), (want_idx, want_term))) in steps.iter().enumerate() {
-            gate.update_switch_index(0, REGION, SwitchStamp::new(*idx, *term));
-            assert_eq!(
-                gate.latest_switch_stamp(REGION),
-                SwitchStamp::new(*want_idx, *want_term),
-                "step {}",
-                i
-            );
-            assert_eq!(
-                gate.read_index_hint(REGION),
-                (*want_idx, u64::from(*want_term)),
-                "step {}",
-                i
-            );
+        let reads: Vec<u64> = (0..2).map(|_| gate.mint_server_marker()).collect();
+        let waits: Vec<_> = reads
+            .iter()
+            .map(|&m| gate.wait_for_stamp(m, REGION))
+            .collect();
+        let batch = gate.next_marker();
+        gate.record_pending_batch(batch, REGION, reads.clone());
+        gate.release_pending_batches(batch, REGION, SwitchStamp::new(510, 10));
+        for w in waits {
+            assert_eq!(block_on(w.stamp()), Some(SwitchStamp::new(510, 10)));
         }
-        // Per region.
-        assert_eq!(gate.read_index_hint(REGION + 1), (u64::MAX, 0));
     }
 
     /// The batched path fails closed on a 0 answer the same way the stamp path
@@ -677,121 +704,83 @@ mod tests {
     fn test_zero_answer_does_not_release_pending_batches() {
         let (gate, _rx) = SwitchReadGate::new();
         let marker = gate.mint_server_marker();
-        assert_pending(poll(&gate, marker, false));
-
-        // This store saw a high value before the switch rebooted.
-        gate.update_switch_index(0, REGION, st(500));
+        let w = gate.wait_for_stamp(marker, REGION);
 
         let batch = gate.next_marker();
         gate.record_pending_batch(batch, REGION, vec![marker]);
         gate.release_pending_batches(batch, REGION, st(0));
-        assert_pending(poll(&gate, marker, false));
+        assert!(waiting(&gate, marker, REGION));
 
         // Once the switch answers with a real index again, the batch releases.
         let batch = gate.next_marker();
         gate.record_pending_batch(batch, REGION, vec![marker]);
         gate.release_pending_batches(batch, REGION, st(500));
-        assert_resolved(poll(&gate, marker, false), st(500));
+        assert_eq!(block_on(w.stamp()), Some(st(500)));
     }
 
-    /// The floor is this batch's answer, not the region's high-water cache.
+    /// A read that hears nothing gives up at the deadline. It is then neither
+    /// queried for nor resolved by a late answer.
     #[test]
-    fn test_batch_releases_at_the_answered_index_not_the_cache() {
+    fn test_wait_gives_up_at_the_deadline() {
         let (gate, _rx) = SwitchReadGate::new();
         let marker = gate.mint_server_marker();
-        assert_pending(poll(&gate, marker, false));
-
-        // An unrelated, later sample raises the region cache.
-        gate.update_switch_index(0, REGION, st(900));
-
+        let w = gate.wait_for_stamp(marker, REGION);
         let batch = gate.next_marker();
         gate.record_pending_batch(batch, REGION, vec![marker]);
-        gate.release_pending_batches(batch, REGION, SwitchStamp::new(500, 4));
-        // The read gets the batch's own stamp, term included.
-        assert_resolved(poll(&gate, marker, false), SwitchStamp::new(500, 4));
+
+        let start = Instant::now();
+        assert_eq!(block_on(w.stamp()), None);
+        assert!(start.elapsed() >= READ_GATE_DEADLINE);
+        assert!(!waiting(&gate, marker, REGION));
+
+        gate.release_pending_batches(batch, REGION, st(500));
+        assert_eq!(gate.answers.lock().unwrap().stamps.len(), 0);
+        assert!(gate.answers.lock().unwrap().waiting.is_empty());
     }
 
-    /// A region the switch has said nothing about hints an index no node can
-    /// have committed, so raft-rs forwards the read. raft-rs twin:
-    /// `test_switch_hint_gate`.
+    /// A read is proposed with its own stamp, term included; with no stamp, or
+    /// an unusable one, with a hint no node can commit, which forwards it.
+    /// raft-rs twin: `test_switch_hint_gate`.
     #[test]
-    fn test_read_index_hint_is_unreachable_until_the_switch_speaks() {
+    fn test_switch_hint() {
+        assert_eq!(switch_hint(Some(SwitchStamp::new(77, 5))), (77, 5));
+        assert_eq!(switch_hint(None), (UNKNOWN_SWITCH_INDEX_HINT, 0));
+        assert_eq!(
+            switch_hint(Some(SwitchStamp::new(0, 5))),
+            (UNKNOWN_SWITCH_INDEX_HINT, 0)
+        );
+        assert_eq!(
+            switch_hint(Some(SwitchStamp::new(77, 0))),
+            (UNKNOWN_SWITCH_INDEX_HINT, 0)
+        );
+    }
+
+    /// The hint verdict follows raft-rs's serve test, term compared in 32 bits.
+    /// raft-rs twin: `test_switch_hint_term_gate`.
+    #[test]
+    fn test_hint_verdict() {
+        let term = u64::from(TERM);
+        let verdict = |stamp| {
+            let (hint, hint_term) = switch_hint(stamp);
+            hint_verdict(hint, hint_term, term, 40)
+        };
+        assert_eq!(verdict(None), "no_stamp");
+        assert_eq!(verdict(Some(SwitchStamp::new(40, TERM + 1))), "other_term");
+        assert_eq!(verdict(Some(st(41))), "above_commit");
+        assert_eq!(verdict(Some(st(40))), "met");
+        assert_eq!(hint_verdict(40, term, term + (1 << 32), 40), "met");
+    }
+
+    /// Only regions published as having a local follower wait for stamps.
+    #[test]
+    fn test_local_follower_flag() {
         let (gate, _rx) = SwitchReadGate::new();
-        assert_eq!(gate.read_index_hint(REGION), (u64::MAX, 0));
-
-        // A zero answer is not information, so it does not change the hint.
-        gate.update_switch_index(0, REGION, st(0));
-        assert_eq!(gate.read_index_hint(REGION), (u64::MAX, 0));
-
-        // A real answer becomes the hint verbatim, with its term.
-        gate.update_switch_index(0, REGION, st(77));
-        assert_eq!(gate.read_index_hint(REGION), (77, u64::from(TERM)));
-
-        // A later reboot answer neither lowers the cache nor re-arms the
-        // unreachable hint.
-        gate.update_switch_index(0, REGION, st(0));
-        assert_eq!(gate.read_index_hint(REGION), (77, u64::from(TERM)));
-
-        // The hint is per region, like the cache.
-        assert_eq!(gate.read_index_hint(REGION + 1), (u64::MAX, 0));
-    }
-
-    /// Failing closed still terminates: a read that only ever gets 0 answers
-    /// gives up at the deadline.
-    #[test]
-    fn test_zero_stamp_still_gives_up_when_expired() {
-        let (gate, _rx) = SwitchReadGate::new();
-        let marker = gate.mint_server_marker();
-        assert_pending(poll(&gate, marker, false));
-        gate.update_switch_index(marker, REGION, st(0));
-        match poll(&gate, marker, true) {
-            ReadGatePoll::GiveUp => {}
-            ReadGatePoll::Resolved(s) => panic!("expected GiveUp, got Resolved({:?})", s),
-            ReadGatePoll::Pending => panic!("expected GiveUp, got Pending"),
-        }
-    }
-
-    /// SAFE-1: a read's own stamp is a floor only in the term raft served the
-    /// read in, compared on the 32 bits the switch carries. In any other term
-    /// (or with no information) it gives no floor, and the assist gate fails
-    /// the read through its GiveUp path.
-    #[test]
-    fn test_floor_applies_only_in_the_stamps_term() {
-        let s = SwitchStamp::new(300, 7);
-        assert_eq!(s.floor_in_term(7), Some(300));
-        // The low 32 bits of a term above 2^32.
-        assert_eq!(s.floor_in_term((1 << 32) + 7), Some(300));
-        // An earlier or later term.
-        assert_eq!(s.floor_in_term(6), None);
-        assert_eq!(s.floor_in_term(8), None);
-        // Unusable stamps never give a floor, whatever the term.
-        assert_eq!(SwitchStamp::new(300, 0).floor_in_term(0), None);
-        assert_eq!(SwitchStamp::new(0, 7).floor_in_term(7), None);
-    }
-
-    /// SAFE-1: the term a stamp was taken in survives the gate. A read
-    /// resolved by its client stamp and one released by a batch each get their
-    /// own stamp's term, which is what the floor check compares.
-    #[test]
-    fn test_resolution_carries_the_stamps_term() {
-        let (gate, _rx) = SwitchReadGate::new();
-        let client = 0xABCD_0000_0000_0077;
-        gate.update_switch_index(client, REGION, SwitchStamp::new(500, 9));
-        assert_resolved(poll(&gate, client, false), SwitchStamp::new(500, 9));
-
-        let server = gate.mint_server_marker();
-        assert_pending(poll(&gate, server, false));
-        let batch = gate.next_marker();
-        gate.record_pending_batch(batch, REGION, vec![server]);
-        gate.release_pending_batches(batch, REGION, SwitchStamp::new(510, 10));
-        match poll(&gate, server, false) {
-            ReadGatePoll::Resolved(s) => {
-                assert_eq!(s, SwitchStamp::new(510, 10));
-                assert_eq!(s.floor_in_term(10), Some(510));
-                assert_eq!(s.floor_in_term(9), None);
-            }
-            _ => panic!("batch did not release the read"),
-        }
+        assert!(!gate.is_local_follower(REGION));
+        gate.set_local_follower(REGION, true);
+        assert!(gate.is_local_follower(REGION));
+        assert!(!gate.is_local_follower(REGION + 1));
+        gate.set_local_follower(REGION, false);
+        assert!(!gate.is_local_follower(REGION));
     }
 
     /// SAFE-3: every instance draws its own nonzero incarnation, every batch
@@ -821,70 +810,76 @@ mod tests {
         let (gate, _rx) = SwitchReadGate::new();
         let id = |seq: u32| u64::from(gate.batch_incarnation) << 32 | u64::from(seq);
         let reads: Vec<u64> = (0..4).map(|_| gate.mint_server_marker()).collect();
+        let mut waits = Vec::new();
         for (&read, seq) in reads.iter().zip([u32::MAX - 1, u32::MAX, 0, 1]) {
-            assert_pending(poll(&gate, read, false));
+            waits.push(gate.wait_for_stamp(read, REGION));
             gate.record_pending_batch(id(seq), REGION, vec![read]);
         }
 
         gate.release_pending_batches(id(u32::MAX), REGION, st(900));
-        assert_resolved(poll(&gate, reads[0], false), st(900));
-        assert_resolved(poll(&gate, reads[1], false), st(900));
-        assert_pending(poll(&gate, reads[2], false));
-        assert_pending(poll(&gate, reads[3], false));
+        assert!(!waiting(&gate, reads[0], REGION));
+        assert!(!waiting(&gate, reads[1], REGION));
+        assert!(waiting(&gate, reads[2], REGION));
+        assert!(waiting(&gate, reads[3], REGION));
 
         gate.release_pending_batches(id(1), REGION, st(1200));
-        assert_resolved(poll(&gate, reads[2], false), st(1200));
-        assert_resolved(poll(&gate, reads[3], false), st(1200));
+        let got: Vec<_> = waits.into_iter().map(|w| block_on(w.stamp())).collect();
+        assert_eq!(
+            got,
+            vec![Some(st(900)), Some(st(900)), Some(st(1200)), Some(st(1200))]
+        );
         assert!(gate.pending_batches.lock().unwrap().is_empty());
     }
 
     /// SAFE-6: a stamp is one region's register, so it never answers a read in
-    /// another region, whether it lands before the read polls or while it
+    /// another region, whether it lands before the read waits or while it
     /// waits. The read is answered by its own region's stamp.
     #[test]
     fn test_stamp_for_another_region_does_not_resolve() {
         const OTHER: u64 = REGION + 1;
         let (gate, _rx) = SwitchReadGate::new();
-        let during = 0xABCD_0000_0000_0001;
-        let before = 0xABCD_0000_0000_0002;
+        let during = 0xABCD_0000_0000_0005;
+        let before = 0xABCD_0000_0000_0006;
 
-        assert_pending(poll(&gate, during, false));
-        gate.update_switch_index(during, OTHER, st(500));
-        assert_pending(poll(&gate, during, false));
+        let w = gate.wait_for_stamp(during, REGION);
+        gate.resolve_marker(during, OTHER, st(500));
+        assert!(waiting(&gate, during, REGION));
 
-        gate.update_switch_index(before, OTHER, st(500));
-        assert_pending(poll(&gate, before, false));
+        gate.resolve_marker(before, OTHER, st(500));
+        let _b = gate.wait_for_stamp(before, REGION);
+        assert!(waiting(&gate, before, REGION));
 
         // A batch answer for the other region releases neither.
         let batch = gate.next_marker();
         gate.record_pending_batch(batch, OTHER, vec![during, before]);
         gate.release_pending_batches(batch, OTHER, st(600));
-        assert_pending(poll(&gate, during, false));
-        assert_pending(poll(&gate, before, false));
+        assert!(waiting(&gate, during, REGION));
+        assert!(waiting(&gate, before, REGION));
 
-        gate.update_switch_index(during, REGION, st(42));
-        assert_resolved(poll(&gate, during, false), st(42));
+        gate.resolve_marker(during, REGION, st(42));
+        assert_eq!(block_on(w.stamp()), Some(st(42)));
     }
 
-    /// SAFE-6: one marker waiting in two regions is two pending reads. Each
-    /// is queued for its own region's query, and each region's answer
-    /// releases only its own.
+    /// SAFE-6: one marker waiting in two regions is two waiting reads. Each is
+    /// queued for its own region's query, and each region's answer resolves
+    /// only its own.
     #[test]
     fn test_same_marker_in_two_regions_is_tracked_per_region() {
         const OTHER: u64 = REGION + 1;
         let (gate, rx) = SwitchReadGate::new();
-        let marker = 0xABCD_0000_0000_0003;
+        let marker = 0xABCD_0000_0000_0007;
 
-        assert_pending(gate.poll_read_gate(marker, REGION, false));
-        assert_pending(gate.poll_read_gate(marker, OTHER, false));
+        let in_region = gate.wait_for_stamp(marker, REGION);
+        let in_other = gate.wait_for_stamp(marker, OTHER);
         let queued: Vec<(u64, u64)> = rx.try_iter().collect();
         assert_eq!(queued, vec![(marker, REGION), (marker, OTHER)]);
         assert_eq!(gate.retain_pending(&queued), queued);
 
-        gate.update_switch_index(marker, OTHER, st(900));
-        assert_resolved(gate.poll_read_gate(marker, OTHER, false), st(900));
-        assert_pending(gate.poll_read_gate(marker, REGION, false));
+        gate.resolve_marker(marker, OTHER, st(900));
+        assert_eq!(block_on(in_other.stamp()), Some(st(900)));
         assert_eq!(gate.retain_pending(&queued), vec![(marker, REGION)]);
+        gate.resolve_marker(marker, REGION, st(901));
+        assert_eq!(block_on(in_region.stamp()), Some(st(901)));
     }
 
     /// Under steady inserts, unclaimed answers expire one to two `RESOLVED_TTL`

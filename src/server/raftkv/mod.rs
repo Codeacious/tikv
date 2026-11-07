@@ -48,7 +48,8 @@ use raftstore::{
     router::{LocalReadRouter, RaftStoreRouter, ReadContext},
     store::{
         self, util::encode_start_ts_into_flag_data, Callback as StoreCallback, RaftCmdExtraOpts,
-        ReadIndexContext, ReadResponse, RegionSnapshot, StoreMsg, WriteResponse,
+        ReadIndexContext, ReadResponse, RegionSnapshot, StampWait, StoreMsg, SwitchReadGate,
+        SwitchStamp, WriteResponse,
     },
     RegionInfoAccessor, SeekRegionCallback,
 };
@@ -760,53 +761,78 @@ where
     cmd.set_header(header);
     cmd.set_requests(vec![req].into());
     let tracker = get_tls_tracker_token();
-    // Assist read_mode: lift the client's switch read-gate marker off the request
-    // body onto the callback, which is the one object that survives all the way
-    // into the raftstore read queue.
-    let read_gate_marker = crate::server::udp_sidechannel::read_gate_marker_from_ctx(ctx.pb_ctx);
-    let store_cb = StoreCallback::read_with_marker(
-        Box::new(move |resp| {
-            let res = on_read_result(resp).map_err(Error::into);
-            if res.is_ok() {
-                let elapse = begin_instant.saturating_elapsed_secs();
-                GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
-                    if tracker.metrics.read_index_propose_wait_nanos > 0 {
+    let read_cb: Box<dyn FnOnce(ReadResponse<E::Snapshot>) + Send> = Box::new(move |resp| {
+        let res = on_read_result(resp).map_err(Error::into);
+        if res.is_ok() {
+            let elapse = begin_instant.saturating_elapsed_secs();
+            GLOBAL_TRACKERS.with_tracker(tracker, |tracker| {
+                if tracker.metrics.read_index_propose_wait_nanos > 0 {
+                    ASYNC_REQUESTS_DURATIONS_VEC
+                        .snapshot_read_index_propose_wait
+                        .observe(
+                            tracker.metrics.read_index_propose_wait_nanos as f64 / 1_000_000_000.0,
+                        );
+                    // snapshot may be handled by lease read in raftstore
+                    if tracker.metrics.read_index_confirm_wait_nanos > 0 {
                         ASYNC_REQUESTS_DURATIONS_VEC
-                            .snapshot_read_index_propose_wait
+                            .snapshot_read_index_confirm
                             .observe(
-                                tracker.metrics.read_index_propose_wait_nanos as f64
+                                tracker.metrics.read_index_confirm_wait_nanos as f64
                                     / 1_000_000_000.0,
                             );
-                        // snapshot may be handled by lease read in raftstore
-                        if tracker.metrics.read_index_confirm_wait_nanos > 0 {
-                            ASYNC_REQUESTS_DURATIONS_VEC
-                                .snapshot_read_index_confirm
-                                .observe(
-                                    tracker.metrics.read_index_confirm_wait_nanos as f64
-                                        / 1_000_000_000.0,
-                                );
-                        }
-                    } else if tracker.metrics.local_read {
-                        ASYNC_REQUESTS_DURATIONS_VEC
-                            .snapshot_local_read
-                            .observe(elapse);
                     }
-                });
-                ASYNC_REQUESTS_DURATIONS_VEC.snapshot.observe(elapse);
-                ASYNC_REQUESTS_COUNTER_VEC.snapshot.success.inc();
-            }
-            cb(res);
-        }),
-        read_gate_marker,
-    );
+                } else if tracker.metrics.local_read {
+                    ASYNC_REQUESTS_DURATIONS_VEC
+                        .snapshot_local_read
+                        .observe(elapse);
+                }
+            });
+            ASYNC_REQUESTS_DURATIONS_VEC.snapshot.observe(elapse);
+            ASYNC_REQUESTS_COUNTER_VEC.snapshot.success.inc();
+        }
+        cb(res);
+    });
 
-    let read_ctx = ReadContext::new(ctx.read_id, ctx.start_ts.map(|ts| ts.into_inner()));
+    // Assist read_mode: a follower read waits for its own switch stamp before it is
+    // proposed, and carries it on the callback into raftstore as raft-rs's hint. A
+    // stamp that is already here (its gate packet landed first) is dispatched at
+    // once; otherwise the dispatch waits in the returned future.
+    let read_ts = ctx.start_ts.map(|ts| ts.into_inner());
+    let mut deferred = None;
     if res.is_ok() {
-        res = router
-            .read(read_ctx, cmd, store_cb)
-            .map_err(kv::Error::from);
+        match switch_stamp_wait(store::global_switch_read_gate(), &ctx) {
+            Some(StampWait::Pending(wait)) => {
+                // A read id belongs to the thread that made it, and another thread may
+                // resume this future, so the deferred read goes without one.
+                deferred = Some((wait, router.clone(), cmd, read_cb));
+            }
+            ready => {
+                let stamp = match ready {
+                    Some(StampWait::Ready(stamp)) => Some(stamp),
+                    _ => None,
+                };
+                let read_ctx = ReadContext::new(ctx.read_id, read_ts);
+                res = router
+                    .read(
+                        read_ctx,
+                        cmd,
+                        StoreCallback::read_with_stamp(read_cb, tracker, stamp),
+                    )
+                    .map_err(kv::Error::from);
+            }
+        }
     }
     async move {
+        if let Some((wait, mut router, cmd, read_cb)) = deferred {
+            let stamp = wait.await;
+            res = router
+                .read(
+                    ReadContext::new(None, read_ts),
+                    cmd,
+                    StoreCallback::read_with_stamp(read_cb, tracker, stamp),
+                )
+                .map_err(kv::Error::from);
+        }
         let res = match res {
             Ok(()) => match f.await {
                 Ok(r) => r,
@@ -837,6 +863,33 @@ where
             }
         }
     }
+}
+
+/// Assist read_mode: starts the wait for a follower read's own switch stamp,
+/// which raftstore then proposes the read with as raft-rs's hint
+/// (`SwitchReadGate::wait_for_stamp`). `None` when the read waits for none: no
+/// switch gate (another read mode), not a replica read, a stale read, a read on
+/// behalf of another region, or a region whose peer here is not a follower. A
+/// follower read proposed without a stamp is forwarded to the leader.
+fn switch_stamp_wait(
+    gate: Option<Arc<SwitchReadGate>>,
+    ctx: &SnapContext<'_>,
+) -> Option<StampWait<impl Future<Output = Option<SwitchStamp>> + Send + 'static>> {
+    let gate = gate?;
+    let pb_ctx = ctx.pb_ctx;
+    if !pb_ctx.get_replica_read() || pb_ctx.get_stale_read() || ctx.extra_region_override.is_some()
+    {
+        return None;
+    }
+    let region_id = pb_ctx.get_region_id();
+    if !gate.is_local_follower(region_id) {
+        return None;
+    }
+    let marker = match crate::server::udp_sidechannel::read_gate_marker_from_ctx(pb_ctx) {
+        0 => gate.mint_server_marker(),
+        marker => marker,
+    };
+    Some(gate.wait_for_stamp(marker, region_id))
 }
 
 #[derive(Clone)]
@@ -927,6 +980,56 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+
+    /// Assist read_mode: only a replica read of a region this store follows
+    /// waits for its switch stamp, on its client's marker, or on a minted
+    /// server marker without one. A stamp that is already here is ready at
+    /// once.
+    #[test]
+    fn test_switch_stamp_wait() {
+        let (gate, _rx) = SwitchReadGate::new();
+        let region = 3;
+        let client = 0xABCD_0000_0000_0001;
+        let mut pb = Context::default();
+        pb.set_region_id(region);
+        pb.set_replica_read(true);
+        pb.set_txn_source(client);
+        let wait = |gate: Option<Arc<SwitchReadGate>>, pb: &Context| {
+            switch_stamp_wait(
+                gate,
+                &SnapContext {
+                    pb_ctx: pb,
+                    ..Default::default()
+                },
+            )
+        };
+
+        // Other read modes have no gate, and a leader's reads never wait.
+        assert!(wait(None, &pb).is_none());
+        assert!(wait(Some(gate.clone()), &pb).is_none());
+
+        gate.set_local_follower(region, true);
+        gate.resolve_marker(client, region, SwitchStamp::new(9, 2));
+        assert!(matches!(
+            wait(Some(gate.clone()), &pb),
+            Some(StampWait::Ready(s)) if s == SwitchStamp::new(9, 2)
+        ));
+
+        // No client marker (or one outside the client namespace): a server marker,
+        // answered by a batched query.
+        pb.set_txn_source(5);
+        assert!(matches!(
+            wait(Some(gate.clone()), &pb),
+            Some(StampWait::Pending(_))
+        ));
+
+        // Not a replica read, or a stale read: no wait.
+        pb.set_replica_read(false);
+        assert!(wait(Some(gate.clone()), &pb).is_none());
+        pb.set_replica_read(true);
+        pb.set_stale_read(true);
+        assert!(wait(Some(gate.clone()), &pb).is_none());
+    }
 
     // This test ensures `ReplicaReadLockChecker` won't change UUID context of read
     // index.

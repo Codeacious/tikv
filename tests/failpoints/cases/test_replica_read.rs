@@ -814,3 +814,163 @@ fn test_read_index_lock_checking_on_false_leader() {
     let resp = block_on_timeout(resp.as_mut(), Duration::from_secs(2)).unwrap();
     assert!(resp.get_header().has_error());
 }
+
+fn must_read_value(resp: &kvproto::raft_cmdpb::RaftCmdResponse, value: &[u8]) {
+    assert!(!resp.get_header().has_error(), "{:?}", resp);
+    assert_eq!(resp.get_responses()[0].get_get().get_value(), value);
+}
+
+/// Drops every read index answer the leader sends to peer 2.
+fn no_read_answers() -> Box<RegionPacketFilter> {
+    Box::new(
+        RegionPacketFilter::new(1, 2)
+            .direction(Direction::Recv)
+            .msg_type(MessageType::MsgReadIndexResp),
+    )
+}
+
+/// A two-node `grant-leases` cluster with the leader on store 1, `k1` = `v1`
+/// applied on both stores, and peer 2 holding a follower read lease: a read
+/// from it completed while no answer from the leader could reach it. The region
+/// then stays idle, so its commit index moves only if a test writes.
+fn new_leased_follower_cluster(
+    retry_ticks: usize,
+) -> (Cluster<NodeCluster>, kvproto::metapb::Region) {
+    let mut cluster = new_node_cluster(0, 2);
+    configure_for_lease_read(&mut cluster.cfg, Some(50), Some(20));
+    cluster.cfg.raft_store.read_mode = "grant-leases".to_owned();
+    cluster.cfg.raft_store.raft_read_index_retry_interval_ticks = retry_ticks;
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+
+    let rid = cluster.run_conf_change();
+    pd_client.must_add_peer(rid, new_peer(2, 2));
+    cluster.must_put(b"k1", b"v1");
+    must_get_equal(&cluster.get_engine(2), b"k1", b"v1");
+    cluster.must_transfer_leader(1, new_peer(1, 1));
+    let region = cluster.get_region(b"k1");
+
+    cluster.sim.wl().add_recv_filter(2, no_read_answers());
+    let mut leased = false;
+    for _ in 0..30 {
+        let mut resp = async_read_on_peer(
+            &mut cluster,
+            new_peer(2, 2),
+            region.clone(),
+            b"k1",
+            false,
+            true,
+        );
+        if let Ok(r) = block_on_timeout(resp.as_mut(), Duration::from_millis(100)) {
+            must_read_value(&r, b"v1");
+            leased = true;
+            break;
+        }
+    }
+    assert!(leased, "peer 2 never held a follower read lease");
+    cluster.sim.wl().clear_recv_filters(2);
+    // Let the reads forwarded before the lease finish (LIVE-1 re-proposes them).
+    thread::sleep(Duration::from_millis(200));
+    (cluster, region)
+}
+
+// Stamp before propose (LIVE-3): a follower read is never served from its lease
+// below its switch stamp. A stamp the follower has committed is served from the
+// lease at once. One above its commit index is held by raft-rs for at most 5 ms
+// (not at all past the 100-entry hold gap) and forwarded to the leader, and so
+// is a read with no stamp. The leader's answers to peer 2 are dropped, so only
+// a read served from the lease can complete. raftstore v1 only.
+#[test]
+fn test_replica_read_stamp_above_commit_goes_to_the_leader() {
+    let (mut cluster, region) = new_leased_follower_cluster(1000);
+    cluster.sim.wl().add_recv_filter(2, no_read_answers());
+
+    fail::cfg("replica_read_stamp_ahead", "return(0)").unwrap();
+    let resp = async_read_on_peer(
+        &mut cluster,
+        new_peer(2, 2),
+        region.clone(),
+        b"k1",
+        false,
+        true,
+    );
+    must_read_value(
+        &block_on_timeout(resp, Duration::from_secs(1)).unwrap(),
+        b"v1",
+    );
+
+    let mut stuck = vec![];
+    for ahead in ["50", "150", "18446744073709551615"] {
+        fail::cfg("replica_read_stamp_ahead", &format!("return({})", ahead)).unwrap();
+        let mut resp = async_read_on_peer(
+            &mut cluster,
+            new_peer(2, 2),
+            region.clone(),
+            b"k1",
+            false,
+            true,
+        );
+        block_on_timeout(resp.as_mut(), Duration::from_millis(300)).expect_err(&format!(
+            "a read with a stamp {} past commit was served from the lease",
+            ahead
+        ));
+        stuck.push(resp);
+    }
+    fail::remove("replica_read_stamp_ahead");
+
+    // With answers flowing again, a read served from the lease moves the queue past
+    // the stuck ones, which are re-proposed (LIVE-1) and served.
+    cluster.sim.wl().clear_recv_filters(2);
+    let resp = async_read_on_peer(
+        &mut cluster,
+        new_peer(2, 2),
+        region.clone(),
+        b"k1",
+        false,
+        true,
+    );
+    must_read_value(
+        &block_on_timeout(resp, Duration::from_secs(1)).unwrap(),
+        b"v1",
+    );
+    for resp in stuck {
+        must_read_value(
+            &block_on_timeout(resp, Duration::from_secs(1)).unwrap(),
+            b"v1",
+        );
+    }
+    cluster.shutdown();
+}
+
+// Stamp before propose, rule S1: the stock retry re-steps a follower read with
+// its stamp, as it was proposed, never with no hint at all, which the follower
+// lease would serve below the stamp. The read's stamp is above commit and the
+// leader's answers to peer 2 are dropped, so the retry, which runs every two 50
+// ms ticks here, must keep sending it to the leader. raftstore v1 only.
+#[test]
+fn test_retry_keeps_the_stamp() {
+    let (mut cluster, region) = new_leased_follower_cluster(2);
+    cluster.sim.wl().add_recv_filter(2, no_read_answers());
+
+    fail::cfg("replica_read_stamp_ahead", "return(50)").unwrap();
+    let mut stuck = async_read_on_peer(
+        &mut cluster,
+        new_peer(2, 2),
+        region.clone(),
+        b"k1",
+        false,
+        true,
+    );
+    block_on_timeout(stuck.as_mut(), Duration::from_millis(600))
+        .expect_err("a retry served the read from the lease below its stamp");
+    fail::remove("replica_read_stamp_ahead");
+
+    // Once its stamp no longer stands in the way and answers flow, a retry serves
+    // it.
+    cluster.sim.wl().clear_recv_filters(2);
+    must_read_value(
+        &block_on_timeout(stuck, Duration::from_secs(3)).unwrap(),
+        b"v1",
+    );
+    cluster.shutdown();
+}
