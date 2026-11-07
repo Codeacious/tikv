@@ -171,6 +171,11 @@ where
     /// This will be reset to 0 once it receives any messages from leader.
     missing_ticks: usize,
     hibernate_state: HibernateState,
+    /// raft-rs's lease counters as last folded into the store-wide
+    /// `FOLLOWER_LEASE_READS_TOTAL` and `SIDECHANNEL_CREDIT_ACCEPTED_TOTAL`
+    /// (EXP-6): `[incarnation, query, local, held, credits accepted]`. A new
+    /// `ReadOnly` incarnation means raft-rs started over at 0.
+    read_lease_stats_seen: [u64; 5],
     stopped: bool,
     has_ready: bool,
     mailbox: Option<BasicMailbox<PeerFsm<EK, ER>>>,
@@ -309,6 +314,7 @@ where
                 read_index_delay_armed_at: None,
                 missing_ticks: 0,
                 hibernate_state: HibernateState::ordered(),
+                read_lease_stats_seen: [0; 5],
                 stopped: false,
                 has_ready: false,
                 mailbox: None,
@@ -373,6 +379,7 @@ where
                 read_index_delay_armed_at: None,
                 missing_ticks: 0,
                 hibernate_state: HibernateState::ordered(),
+                read_lease_stats_seen: [0; 5],
                 stopped: false,
                 has_ready: false,
                 mailbox: None,
@@ -2398,6 +2405,49 @@ where
         self.schedule_read_index_delay_tick();
     }
 
+    /// Folds this region's raft-rs lease counters into the store-wide
+    /// `FOLLOWER_LEASE_READS_TOTAL` (follower reads) and
+    /// `SIDECHANNEL_CREDIT_ACCEPTED_TOTAL` (switch credits a leader accepted),
+    /// as the deltas since the last fold (EXP-6).
+    /// raft-rs counts only under GrantLeases, so other modes add nothing. It
+    /// zeroes its counters when it rebuilds `ReadOnly` on a reset, which also
+    /// draws a new incarnation; then the whole count is new. Run on the base
+    /// tick: reads that arrive wake a hibernated region, so none go unfolded
+    /// for long.
+    fn flush_read_lease_stats(&mut self) {
+        let ro = &self.fsm.peer.raft_group.raft.read_only;
+        let st = ro.read_lease_stats;
+        let now = [
+            ro.incarnation_id(),
+            st.times_got_read_query,
+            st.times_read_lease_used,
+            st.times_read_held,
+            st.times_credit_accepted,
+        ];
+        let seen = &mut self.fsm.read_lease_stats_seen;
+        let fresh = now[0] != seen[0];
+        let delta = |i: usize| {
+            if fresh {
+                now[i]
+            } else {
+                now[i].saturating_sub(seen[i])
+            }
+        };
+        for (i, kind) in [(1, "query"), (2, "local"), (3, "held")] {
+            let d = delta(i);
+            if d > 0 {
+                FOLLOWER_LEASE_READS_TOTAL
+                    .with_label_values(&[kind])
+                    .inc_by(d);
+            }
+        }
+        let d = delta(4);
+        if d > 0 {
+            SIDECHANNEL_CREDIT_ACCEPTED_TOTAL.inc_by(d);
+        }
+        *seen = now;
+    }
+
     /// Arms a timer to drive follower read-lease renewal.
     /// raft-rs only renews a lease when it processes a heartbeat or a read.
     /// The handler re-arms from the next renewal deadline.
@@ -2621,12 +2671,7 @@ where
             return;
         }
 
-        // Assist read_mode: expose raft-rs read-lease stats as Prometheus gauges.
-        if crate::store::global_switch_read_gate().is_some() {
-            let stats = self.fsm.peer.raft_group.status().read_lease_stats;
-            RAFT_TIMES_READ_LEASE_USED.set(stats.times_read_lease_used as i64);
-            RAFT_TIMES_GOT_READ_QUERY.set(stats.times_got_read_query as i64);
-        }
+        self.flush_read_lease_stats();
 
         // Update the state whether the peer is pending on applying raft
         // logs if necesssary.

@@ -789,24 +789,69 @@ lazy_static! {
             "Pending read index count."
         ).unwrap();
 
-    // "Assist" read_mode gauges.
-    // These two mirror the cumulative counters raft-rs maintains in ReadLeaseStats.
-    // Unlabelled, so with several regions per store, each region's tick overwrites the last;
-    // the value is whichever region ticked most recently, and raft-rs zeroes the
-    // underlying counters on term changes.
-    // TODO: Treat as a debug indicator only until labelled by region or summed.
-    pub static ref RAFT_TIMES_READ_LEASE_USED: IntGauge =
-        register_int_gauge!(
-            "tikv_raftstore_times_read_lease_used",
-            "Cumulative follower reads served locally under a read lease (from raft)."
+}
+
+// EXP-6 counters, in a block of their own: the one above is at the macro
+// recursion limit.
+lazy_static! {
+    // Follower reads under grant-leases, summed over this store's regions
+    // (EXP-6). Each region's raft-rs ReadLeaseStats are folded in as deltas on
+    // its base tick (`PeerFsmDelegate::flush_read_lease_stats`); these replaced
+    // two unlabelled gauges that each region's tick overwrote.
+    pub static ref FOLLOWER_LEASE_READS_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "tikv_raftstore_follower_lease_reads_total",
+            "Follower reads under grant-leases, by kind: query (decided: served or forwarded), \
+             local (served from this store's lease), held (held for commit to catch up first).",
+            &["kind"]
         ).unwrap();
 
-    pub static ref RAFT_TIMES_GOT_READ_QUERY: IntGauge =
-        register_int_gauge!(
-            "tikv_raftstore_times_got_read_query",
-            "Cumulative read-index queries observed by the read-lease leader (from raft)."
+    // UDP sidechannel outcomes (assist; EXP-6). A mode that falls back to a
+    // slower path still succeeds, so these are what tell it apart.
+    pub static ref SIDECHANNEL_REPLY_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "tikv_raftstore_sidechannel_reply_total",
+            "Switch replies to this leader's writes, by outcome: credited (fed to raft), stale_boot \
+             (another switch boot; dropped), no_value (nothing written this boot), no_mark (nothing \
+             proposed yet), no_route (no copy cached a route), unknown_path (unknown peer or magic).",
+            &["result"]
         ).unwrap();
 
+    pub static ref SIDECHANNEL_CREDIT_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "tikv_raftstore_sidechannel_credit_total",
+            "Switch credits fed to raft, by holder: path (the follower whose path carried the \
+             write) or other_holder (another lease holder behind the same switch, credit-all).",
+            &["holder"]
+        ).unwrap();
+
+    pub static ref SIDECHANNEL_NACK_TOTAL: IntCounterVec =
+        register_int_counter_vec!(
+            "tikv_raftstore_sidechannel_nack_total",
+            "Switch NACKs, by outcome: adopted (a new boot ID), current (re-seed under the current \
+             boot), stale (answers an older belief; ignored), invalid (boot ID 0), unknown_path.",
+            &["result"]
+        ).unwrap();
+
+    // Switch credits raft-rs accepted (term matched, a grant to raise), summed
+    // over this store's leader regions and folded in like the reads above.
+    // SIDECHANNEL_CREDIT_TOTAL counts credits fed to raft, including ones raft
+    // then drops (no grant, another term); this counts what took effect
+    // (review tack-08 F6).
+    pub static ref SIDECHANNEL_CREDIT_ACCEPTED_TOTAL: IntCounter =
+        register_int_counter!(
+            "tikv_raftstore_sidechannel_credit_accepted_total",
+            "Switch credits raft accepted: the term matched and a grant was raised."
+        ).unwrap();
+
+    pub static ref SIDECHANNEL_SEND_DROPPED_TOTAL: IntCounter =
+        register_int_counter!(
+            "tikv_raftstore_sidechannel_send_dropped_total",
+            "Sidechannel messages dropped because the send queue was full."
+        ).unwrap();
+}
+
+lazy_static! {
     pub static ref SIDECHANNEL_MSG_SENT_TOTAL: IntCounterVec =
         register_int_counter_vec!(
             "tikv_raftstore_sidechannel_msg_sent_total",

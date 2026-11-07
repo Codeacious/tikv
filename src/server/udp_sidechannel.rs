@@ -184,9 +184,14 @@ impl<R: RaftExtension + Send + 'static> RaftMessageFeeder for R {
 /// `RaftMessage` for a switch-reflected `MsgAskAckIndexResp`. `self_peer` is
 /// the local (leader) peer; `remote_peer` is the follower we sent to. The
 /// reflected response is injected as if the follower sent it (from/to swapped).
+/// `region_epoch` is the epoch the tapped message carried: raftstore drops a
+/// `RaftMessage` without one (`validate_raft_msg`), which made every credit
+/// inert (EXP-1). An epoch that has since gone stale is handled as for any
+/// late message (`check_msg` drops it only if the follower left the region).
 #[derive(Clone)]
 struct RaftRoute {
     region_id: u64,
+    region_epoch: metapb::RegionEpoch,
     self_peer: metapb::Peer,
     remote_peer: metapb::Peer,
 }
@@ -587,6 +592,7 @@ impl UdpSidechannel {
                 region_id,
                 RaftRoute {
                     region_id,
+                    region_epoch: msg.get_region_epoch().clone(),
                     self_peer: msg.get_from_peer().clone(),
                     remote_peer: msg.get_to_peer().clone(),
                 },
@@ -831,6 +837,7 @@ impl UdpSidechannel {
     /// channel rather than stalling raft.
     fn enqueue(&self, msg: OutMsg) {
         if self.out_tx.try_send(msg).is_err() {
+            raftstore::store::metrics::SIDECHANNEL_SEND_DROPPED_TOTAL.inc();
             let n = self.out_dropped.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 128 == 1 {
                 warn!("UDP sidechannel out channel full, dropping switch hint"; "total_dropped" => n);
@@ -1009,19 +1016,24 @@ impl UdpSidechannel {
     /// re-seed reads a mark at least as high, so the re-seed covers the
     /// credit.
     fn credit_switch_reply(&self, d: &WireMsg) {
+        let reply = |result: &str| {
+            raftstore::store::metrics::SIDECHANNEL_REPLY_TOTAL
+                .with_label_values(&[result])
+                .inc()
+        };
         let (boot, regions, route) = {
             let peers = self.peers.lock().unwrap();
             let peer = match peers.get(&d.from) {
                 Some(p) => p,
                 // Not (or no longer) a peer of ours.
-                None => return,
+                None => return reply("unknown_path"),
             };
             // The switch on this path answers in the peer's magic, not
             // necessarily ours.
             if d.magic != peer.magic {
                 warn!("received UDP sidechannel reply with invalid magic";
                     "magic" => format!("{:04x}", d.magic), "want" => format!("{:04x}", peer.magic));
-                return;
+                return reply("unknown_path");
             }
             let route = peer.route.lock().unwrap().get(&d.region_id).cloned();
             (peer.boot.clone(), peer.regions.clone(), route)
@@ -1034,6 +1046,7 @@ impl UdpSidechannel {
         self.run_test_hook("credit");
         let current = boot.load(Ordering::SeqCst);
         if d.boot_id != current {
+            reply("stale_boot");
             let n = self.other_boot_replies.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 128 == 1 {
                 info!("dropping switch reply from another boot";
@@ -1047,7 +1060,7 @@ impl UdpSidechannel {
             // Nothing written for this region in this boot (or its slot holds
             // another region): no information, and no credit.
             self.warn_zero_switch_index("MsgAskAckIndexResp", d.region_id);
-            return;
+            return reply("no_value");
         }
         // Mark this (peer, region) path alive so the idle refresh skips it.
         // `get_mut`, not `entry().or_default()`: an entry exists only once
@@ -1060,10 +1073,16 @@ impl UdpSidechannel {
         // Feed the reflected ack into raft (Flow 1 write acceleration) when we
         // have a route for it.
         if credit == 0 {
-            return;
+            return reply("no_mark");
         }
         if let Some(route) = route {
+            reply("credited");
             self.feed_reflected_ack(&route, credit, d.term);
+            raftstore::store::metrics::SIDECHANNEL_CREDIT_TOTAL
+                .with_label_values(&["path"])
+                .inc();
+        } else {
+            reply("no_route");
         }
 
         // Credit-all: credit every other lease holder of this region behind
@@ -1100,6 +1119,9 @@ impl UdpSidechannel {
         };
         for route in extra {
             self.feed_reflected_ack(&route, credit, d.term);
+            raftstore::store::metrics::SIDECHANNEL_CREDIT_TOTAL
+                .with_label_values(&["other_holder"])
+                .inc();
         }
     }
 
@@ -1124,29 +1146,36 @@ impl UdpSidechannel {
     ///   (e.g. delayed across a second reboot). It is ignored: adopting it
     ///   would roll the switch back to a dead boot.
     fn handle_nack(&self, d: &WireMsg) {
+        let nack = |result: &str| {
+            raftstore::store::metrics::SIDECHANNEL_NACK_TOTAL
+                .with_label_values(&[result])
+                .inc()
+        };
         if d.boot_id == 0 {
-            return; // never reported by a switch; nothing to adopt
+            return nack("invalid"); // never reported by a switch; nothing to adopt
         }
         let (path, boot, magic) = {
             let peers = self.peers.lock().unwrap();
             let peer = match peers.get(&d.from) {
                 Some(p) => p,
-                None => return,
+                None => return nack("unknown_path"),
             };
             if d.magic != peer.magic {
                 warn!("received UDP sidechannel NACK with invalid magic";
                     "magic" => format!("{:04x}", d.magic), "want" => format!("{:04x}", peer.magic));
-                return;
+                return nack("unknown_path");
             }
             (peer.path(), peer.boot.clone(), peer.magic)
         };
         let current = boot.load(Ordering::SeqCst);
+        let mut adopted = false;
         if d.marker == u64::from(current)
             && d.boot_id != current
             && boot
                 .compare_exchange(current, d.boot_id, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
         {
+            adopted = true;
             info!("UDP sidechannel switch boot ID changed; re-seeding";
                 "magic" => format!("{:04x}", magic), "store_id" => d.from,
                 "region_id" => d.region_id, "old_boot_id" => current, "boot_id" => d.boot_id);
@@ -1155,6 +1184,7 @@ impl UdpSidechannel {
         // The boot ID first, then the mark (see `switch_write`).
         let boot_id = boot.load(Ordering::SeqCst);
         if d.boot_id != boot_id {
+            nack("stale");
             let n = self.stale_nacks.fetch_add(1, Ordering::Relaxed) + 1;
             if n % 128 == 1 {
                 info!("ignoring stale switch NACK";
@@ -1163,6 +1193,7 @@ impl UdpSidechannel {
             }
             return;
         }
+        nack(if adopted { "adopted" } else { "current" });
         let w = self.region_write_state(d.region_id);
         if w.high_water == 0 {
             return;
@@ -1202,6 +1233,7 @@ impl UdpSidechannel {
 
         let mut rm = RaftMessage::default();
         rm.set_region_id(route.region_id);
+        rm.set_region_epoch(route.region_epoch.clone());
         rm.set_from_peer(route.remote_peer.clone());
         rm.set_to_peer(route.self_peer.clone());
         rm.set_message(inner);
@@ -1612,6 +1644,20 @@ mod tests {
         /// Copies a `MsgAppend` from `LEADER` to `to_store` (entries
         /// `prev + 1 ..= prev + n`), as `RaftClient::send` would.
         fn tap(&self, region_id: u64, to_store: u64, term: u64, prev: u64, n: usize) {
+            self.tap_at_epoch(region_id, to_store, term, prev, n, (1, 1));
+        }
+
+        /// `tap`, with the region epoch `(conf_ver, version)` raftstore
+        /// stamps on every outgoing message.
+        fn tap_at_epoch(
+            &self,
+            region_id: u64,
+            to_store: u64,
+            term: u64,
+            prev: u64,
+            n: usize,
+            (conf_ver, version): (u64, u64),
+        ) {
             let mut m = Message::default();
             m.set_msg_type(MessageType::MsgAppend);
             m.set_from(100 + LEADER);
@@ -1621,6 +1667,8 @@ mod tests {
             m.set_entries(vec![Entry::default(); n].into());
             let mut rm = RaftMessage::default();
             rm.set_region_id(region_id);
+            rm.mut_region_epoch().set_conf_ver(conf_ver);
+            rm.mut_region_epoch().set_version(version);
             rm.set_from_peer(new_peer(LEADER));
             rm.set_to_peer(new_peer(to_store));
             rm.set_message(m);
@@ -2486,6 +2534,114 @@ mod tests {
 
         h.sc.refresh_region(REGION);
         assert_eq!(writes(&h), vec![(2, 120, 7)]);
+    }
+
+    /// EXP-6: each reply and NACK outcome is counted, and each credit by
+    /// whom it went to. The counters are process-wide and tests run in
+    /// parallel, so this checks that each rose, not by exactly how much.
+    #[test]
+    fn test_reply_and_nack_outcomes_are_counted() {
+        use raftstore::store::metrics::{
+            SIDECHANNEL_CREDIT_TOTAL, SIDECHANNEL_NACK_TOTAL, SIDECHANNEL_REPLY_TOTAL,
+        };
+        let reply_n = |r: &str| SIDECHANNEL_REPLY_TOTAL.with_label_values(&[r]).get();
+        let credit_n = |r: &str| SIDECHANNEL_CREDIT_TOTAL.with_label_values(&[r]).get();
+        let nack_n = |r: &str| SIDECHANNEL_NACK_TOTAL.with_label_values(&[r]).get();
+        let rose = |what: &str, before: u64, after: u64| {
+            assert!(
+                after > before,
+                "{} not counted ({} -> {})",
+                what,
+                before,
+                after
+            )
+        };
+
+        let h = Harness::new();
+        h.add_peer(2, TEST_BOOT);
+        h.add_peer(3, TEST_BOOT);
+        h.tap(REGION, 2, 9, 99, 1);
+        h.tap(REGION, 3, 9, 99, 1);
+        h.drain();
+        h.sc.set_lease_holders(REGION, vec![2, 3]);
+
+        let (c, p, o) = (
+            reply_n("credited"),
+            credit_n("path"),
+            credit_n("other_holder"),
+        );
+        h.handle(&reply(2, REGION, 80, TEST_BOOT, 9));
+        rose("credited reply", c, reply_n("credited"));
+        rose("path credit", p, credit_n("path"));
+        rose("other-holder credit", o, credit_n("other_holder"));
+
+        let n = reply_n("stale_boot");
+        h.handle(&reply(2, REGION, 80, TEST_BOOT + 2, 9));
+        rose("stale-boot reply", n, reply_n("stale_boot"));
+        let n = reply_n("no_value");
+        h.handle(&reply(2, REGION, 0, TEST_BOOT, 9));
+        rose("no-value reply", n, reply_n("no_value"));
+        let n = reply_n("unknown_path");
+        h.handle(&reply(7, REGION, 80, TEST_BOOT, 9));
+        rose("unknown-path reply", n, reply_n("unknown_path"));
+
+        let new_boot = TEST_BOOT + 4;
+        let n = nack_n("adopted");
+        h.handle(&nack(2, REGION, new_boot, TEST_BOOT));
+        rose("adopted NACK", n, nack_n("adopted"));
+        let n = nack_n("current");
+        h.handle(&nack(2, REGION, new_boot, TEST_BOOT));
+        rose("current NACK", n, nack_n("current"));
+        let n = nack_n("stale");
+        h.handle(&nack(2, REGION, TEST_BOOT + 6, 0));
+        rose("stale NACK", n, nack_n("stale"));
+        let n = nack_n("invalid");
+        h.handle(&nack(2, REGION, 0, new_boot));
+        rose("invalid NACK", n, nack_n("invalid"));
+    }
+
+    /// EXP-1: raftstore drops a RaftMessage with no region epoch, so every
+    /// credit, the path's own and credit-all's, must carry the epoch of the
+    /// copy that cached its route, and follow it when the epoch changes.
+    #[test]
+    fn test_credit_carries_region_epoch() {
+        let h = Harness::new();
+        h.add_peer(2, TEST_BOOT);
+        h.add_peer(3, TEST_BOOT);
+        h.tap_at_epoch(REGION, 2, 9, 99, 1, (4, 7));
+        h.tap_at_epoch(REGION, 3, 9, 99, 1, (4, 7));
+        h.drain();
+        h.sc.set_lease_holders(REGION, vec![2, 3]);
+
+        let epochs = |h: &Harness| {
+            let mut got: Vec<(u64, u64, u64)> = h
+                .fed
+                .try_iter()
+                .map(|(rm, _)| {
+                    assert!(
+                        rm.has_region_epoch(),
+                        "a credit without an epoch is dropped"
+                    );
+                    let e = rm.get_region_epoch();
+                    (
+                        rm.get_from_peer().get_store_id(),
+                        e.get_conf_ver(),
+                        e.get_version(),
+                    )
+                })
+                .collect();
+            got.sort_unstable();
+            got
+        };
+        h.handle(&reply(2, REGION, 80, TEST_BOOT, 9));
+        assert_eq!(epochs(&h), vec![(2, 4, 7), (3, 4, 7)]);
+
+        // A split bumps the version; the next copies refresh the routes.
+        h.tap_at_epoch(REGION, 2, 9, 100, 1, (4, 8));
+        h.tap_at_epoch(REGION, 3, 9, 100, 1, (4, 8));
+        h.drain();
+        h.handle(&reply(3, REGION, 101, TEST_BOOT, 9));
+        assert_eq!(epochs(&h), vec![(2, 4, 8), (3, 4, 8)]);
     }
 
     /// LIVE-3 Part B: every credit tells raft the term the switch reported with

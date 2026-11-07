@@ -790,3 +790,77 @@ fn test_replica_read_with_pending_peer() {
     let response = block_on_timeout(resp_ch, Duration::from_secs(3)).unwrap();
     assert!(response.get_header().get_error().has_read_index_not_ready());
 }
+
+/// EXP-1 (review tack-08 F9): a switch credit reaches raft-rs through
+/// raftstore's own checks (`validate_raft_msg`, `check_msg`) only if it
+/// carries the region epoch. Follower 3 holds a lease and none of its acks
+/// reach the leader, so the commit clamp holds a write back (3 keeps renewing,
+/// as it stays within the catch-up margin; raft-log GC is off, because its
+/// CompactLog entries, every 100 ms in the test config, would soon carry the
+/// quorum index past that margin, and LIVE-2's renewal check would then rightly
+/// refuse 3 and end the hold). A Term-0 `MsgAskAckIndexResp` for
+/// 3, built as the sidechannel's `feed_reflected_ack` builds it and injected
+/// at the leader's store, releases the write. The same credit without an
+/// epoch, as every credit was built before EXP-1, is dropped and releases
+/// nothing.
+#[test]
+fn test_switch_credit_reaches_raft_through_raftstore() {
+    let mut cluster = new_node_cluster(0, 3);
+    configure_for_lease_read(&mut cluster.cfg, Some(50), Some(20));
+    cluster.cfg.raft_store.read_mode = "grant-leases".to_owned();
+    cluster.cfg.raft_store.raft_log_gc_tick_interval = ReadableDuration::hours(1);
+    let pd_client = Arc::clone(&cluster.pd_client);
+    pd_client.disable_default_operator();
+    cluster.run();
+    cluster.must_transfer_leader(1, new_peer(1, 1));
+    cluster.must_put(b"k0", b"v0");
+    must_get_equal(&cluster.get_engine(3), b"k0", b"v0");
+    // Let the followers' lease asks be granted.
+    thread::sleep(Duration::from_millis(500));
+
+    // From here on 3 appends but its acks never reach the leader. Its lease
+    // asks and heartbeat responses still do.
+    for t in [
+        MessageType::MsgAppendResponse,
+        MessageType::MsgAskAckIndexResp,
+    ] {
+        cluster.add_send_filter(CloneFilterFactory(
+            RegionPacketFilter::new(1, 3)
+                .direction(Direction::Send)
+                .msg_type(t),
+        ));
+    }
+    let mut put = cluster.async_put(b"k1", b"v1").unwrap();
+    block_on_timeout(put.as_mut(), Duration::from_secs(1))
+        .expect_err("the clamp should hold the write while 3 holds a lease");
+
+    let state = cluster.raft_local_state(1, 1);
+    let (term, last) = (state.get_hard_state().get_term(), state.get_last_index());
+    let credit = |epoch: Option<kvproto::metapb::RegionEpoch>| {
+        let mut m = raft::eraftpb::Message::default();
+        m.set_msg_type(MessageType::MsgAskAckIndexResp);
+        m.set_from(3);
+        m.set_to(1);
+        m.set_index(last);
+        m.set_log_term(term); // term 0: a switch credit, in the register's term
+        let mut rm = RaftMessage::default();
+        rm.set_region_id(1);
+        rm.set_from_peer(new_peer(3, 3));
+        rm.set_to_peer(new_peer(1, 1));
+        if let Some(e) = epoch {
+            rm.set_region_epoch(e);
+        }
+        rm.set_message(m);
+        rm
+    };
+
+    cluster.send_raft_msg(credit(None)).unwrap();
+    block_on_timeout(put.as_mut(), Duration::from_secs(1))
+        .expect_err("a credit without an epoch must be dropped by raftstore");
+
+    let epoch = cluster.get_region(b"k1").get_region_epoch().clone();
+    cluster.send_raft_msg(credit(Some(epoch))).unwrap();
+    let resp = block_on_timeout(put.as_mut(), Duration::from_secs(3))
+        .expect("a credit with the epoch should lift the clamp");
+    assert!(!resp.get_header().has_error(), "{:?}", resp);
+}

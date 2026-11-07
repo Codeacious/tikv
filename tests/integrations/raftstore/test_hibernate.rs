@@ -941,3 +941,82 @@ fn test_hibernate_not_enough_matched_peers() {
     must_get_equal(&cluster.get_engine(2), b"k2", b"v2");
     must_get_equal(&cluster.get_engine(3), b"k2", b"v2");
 }
+
+/// Whether the leader on store 1 sends anything for region 1 within two
+/// heartbeat intervals. A hibernated leader sends nothing; an awake one at
+/// least heartbeats. The probe drops what it sees, briefly.
+fn leader_sends_within_two_heartbeats<T: Simulator>(cluster: &mut Cluster<T>) -> bool {
+    let sent = Arc::new(AtomicBool::new(false));
+    let s = sent.clone();
+    cluster.add_send_filter(CloneFilterFactory(
+        RegionPacketFilter::new(1, 1)
+            .direction(Direction::Send)
+            .set_msg_callback(Arc::new(move |_| {
+                s.store(true, Ordering::SeqCst);
+            })),
+    ));
+    thread::sleep(cluster.cfg.raft_store.raft_heartbeat_interval() * 2);
+    cluster.clear_send_filters();
+    sent.load(Ordering::SeqCst)
+}
+
+/// EXP-12: under grant-leases, followers renew their read leases only while
+/// they see reads of their own or replicated writes (raft-rs
+/// `read_lease_idle_timeout_micros`, 10 s by default, counted from the term's
+/// start); this region has neither after its first write. While warm, their
+/// lease asks keep the leader sending (an ask doesn't reset an idle leader's
+/// ticks, but the leader answers it with a lease round and a grant); once idle
+/// past that, the leases lapse and the region goes quiet as a stock one does. A
+/// follower read then wakes it and is served. Ticks are scaled so the election
+/// timeout (1 s) outlasts the lease ask period (about 300 ms), as with TiKV's
+/// defaults (10 s and 300 ms).
+#[test]
+fn test_idle_leased_region_hibernates() {
+    let mut cluster = new_node_cluster(0, 3);
+    let election_timeout = configure_for_lease_read(&mut cluster.cfg, Some(100), Some(10));
+    configure_for_hibernate(&mut cluster.cfg);
+    cluster.cfg.raft_store.read_mode = "grant-leases".to_owned();
+    cluster.run();
+    cluster.must_transfer_leader(1, new_peer(1, 1));
+    // The transfer's new term rebuilt the followers' lease state, which
+    // starts their idle window.
+    let warm_from = std::time::Instant::now();
+    cluster.must_put(b"k1", b"v1");
+    must_get_equal(&cluster.get_engine(3), b"k1", b"v1");
+
+    // Warm: long enough to hibernate a quiet region, but the asks go on, and
+    // the leader answers each one.
+    thread::sleep(election_timeout * 3);
+    assert!(
+        leader_sends_within_two_heartbeats(&mut cluster),
+        "a leader whose followers still renew leases should keep sending"
+    );
+
+    // Idle past 10 s, plus the last lease's 500 ms and time to hibernate.
+    let asleep_by =
+        warm_from + Duration::from_secs(10) + Duration::from_millis(500) + election_timeout * 4;
+    while std::time::Instant::now() < asleep_by {
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !leader_sends_within_two_heartbeats(&mut cluster),
+        "an idle leased region should hibernate once its followers stop renewing"
+    );
+
+    // A follower read wakes it and is served.
+    let region = cluster.get_region(b"k1");
+    let resp = block_on(async_read_on_peer(
+        &mut cluster,
+        new_peer(3, 3),
+        region,
+        b"k1",
+        false,
+        true,
+    ));
+    assert!(!resp.get_header().has_error(), "{:?}", resp);
+    assert_eq!(resp.get_responses()[0].get_get().get_value(), b"v1");
+    assert!(
+        leader_sends_within_two_heartbeats(&mut cluster),
+        "a follower read should wake the region"
+    );
+}
